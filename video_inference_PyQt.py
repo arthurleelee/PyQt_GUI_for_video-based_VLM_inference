@@ -6,6 +6,7 @@ import torch
 import numpy as np
 import imageio
 import gc
+import textwrap
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -13,18 +14,18 @@ from PyQt6.QtWidgets import (
     QFormLayout, QMessageBox, QProgressBar, QStyle, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QImage, QPixmap, QFont
 from collections import deque
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, LlavaOnevisionForConditionalGeneration, AutoModelForImageTextToText, AutoTokenizer, AutoProcessor
 from qwen_vl_utils import process_vision_info
-from PIL import Image
+from PIL import ImageFont, Image, ImageDraw
 
 
 STYLE_SHEET = """
 /* 全域設定 */
 QWidget {
     font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', sans-serif;
-    font-size: 14px;
+    font-size: 16px;
     color: #f0f0f0; /* 亮灰色文字 */
     background-color: #1a1a1a; /* 極暗背景 */
 }
@@ -123,6 +124,7 @@ QSlider::handle:horizontal {
 
 /* 進度條 */
 QProgressBar {
+    background: #f0f0f0;
     border: 1px solid #444444;
     border-radius: 4px;
     text-align: center;
@@ -143,6 +145,17 @@ QProgressBar::chunk {
 """
 
 
+MODEL_MAP = {
+    "Qwen/Qwen2.5-VL-3B-Instruct": Qwen2_5_VLForConditionalGeneration, 
+    "Qwen/Qwen2.5-VL-7B-Instruct": Qwen2_5_VLForConditionalGeneration, 
+    "llava-hf/llava-onevision-qwen2-0.5b-ov-hf": LlavaOnevisionForConditionalGeneration, 
+    "llava-hf/llava-onevision-qwen2-7b-ov-hf": LlavaOnevisionForConditionalGeneration, 
+    "HuggingFaceTB/SmolVLM2-256M-Video-Instruct": AutoModelForImageTextToText, 
+    "HuggingFaceTB/SmolVLM2-500M-Video-Instruct": AutoModelForImageTextToText, 
+    "HuggingFaceTB/SmolVLM2-2.2B-Instruct": AutoModelForImageTextToText,
+}
+
+
 class InferenceWorker(QThread):
     progress_signal = pyqtSignal(int)
     finished_signal = pyqtSignal(str, list) # (output_video_path, generated_texts)
@@ -157,29 +170,52 @@ class InferenceWorker(QThread):
         self.conversation = None
 
         print("--- Loading Conversation Template. ---")
-        conversation = [
-            {
-                "role":"system",
-                "content":[
-                    {
-                        "type": "text",
-                        "text": self.params['system_prompt']
-                    }
-                ]
-            }, 
-            {
-                "role":"user",
-                "content":[
-                    {
-                        "type": "video",
-                    },
-                    {
-                        "type": "text",
-                        "text": self.params['user_prompt']
-                    }
-                ]
-            }
-        ]
+        if "Qwen2.5-VL" in self.params['model_name'] or "llava-onevision-qwen2" in self.params['model_name']:
+            conversation = [
+                {
+                    "role":"system",
+                    "content":[
+                        {
+                            "type": "text",
+                            "text": self.params['system_prompt']
+                        }
+                    ]
+                }, 
+                {
+                    "role":"user",
+                    "content":[
+                        {
+                            "type": "video",
+                        },
+                        {
+                            "type": "text",
+                            "text": self.params['user_prompt']
+                        }
+                    ]
+                }
+            ]
+        else:
+            # Actually, these model will directly convert the video into the multiple images without any time handling.
+            conversation = [
+                {
+                    "role":"system",
+                    "content":[
+                        {
+                            "type": "text",
+                            "text": self.params['system_prompt']
+                        }
+                    ]
+                }, 
+                {
+                    "role":"user",
+                    "content":[{"type": "image",} for _ in range(self.params['frame_accumulation'])] + [
+                        {
+                            "type": "text",
+                            "text": self.params['user_prompt']
+                        }
+                    ]
+                }
+            ]
 
         self.conversation = self.processor.apply_chat_template(
             conversation, tokenize=False, add_generation_prompt=True
@@ -187,11 +223,35 @@ class InferenceWorker(QThread):
         print("--- Complete Conversation Template. ---")
 
     def frame_process(self, PIL_image, text):
-        cv2_image = cv2.cvtColor(np.asarray(PIL_image), cv2.COLOR_RGB2BGR)
-        text_size, baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
-        text_w, text_h = text_size
-        cv2.rectangle(cv2_image, (10, 30 - text_h - 5), (10 + text_w, 30 + baseline), (34, 139, 34, 0.5), -1)
-        cv2.putText(cv2_image, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+        font_path = "./Bitcount_Prop_Single/static/BitcountPropSingle_Roman-SemiBold.ttf"
+        font_size = 28
+        padding = 10
+        line_spacing = 10
+        text_area_height = 150
+        orig_w, orig_h = PIL_image.size
+        new_h = orig_h + text_area_height
+        new_img = Image.new("RGB", (orig_w, new_h), color=(34, 139, 34))
+        new_img.paste(PIL_image, (0, 0))
+        draw = ImageDraw.Draw(new_img)
+        font = ImageFont.truetype(font_path, font_size)
+        wrapped_lines = []
+        for para in text.split("\n"):
+            wrapped = textwrap.fill(para, width=orig_w - 40)
+            wrapped_lines.extend(wrapped.split("\n"))
+        text_x = padding
+        text_y = orig_h + padding
+        for line in wrapped_lines:
+            bbox = font.getbbox(line)
+            line_height = bbox[3] - bbox[1]
+            draw.text((text_x, text_y), line, font=font, fill=(255, 255, 255), spacing=line_spacing)
+            text_y += line_height + line_spacing
+        cv2_image = cv2.cvtColor(np.asarray(new_img), cv2.COLOR_RGB2BGR)
+        # OpenCV
+        # cv2_image = cv2.cvtColor(np.asarray(PIL_image), cv2.COLOR_RGB2BGR)
+        # text_size, baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
+        # text_w, text_h = text_size
+        # cv2.rectangle(cv2_image, (10, 30 - text_h - 5), (10 + text_w, 30 + baseline), (34, 139, 34, 0.5), -1)
+        # cv2.putText(cv2_image, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
         return cv2_image
     
     def stop(self):
@@ -217,7 +277,7 @@ class InferenceWorker(QThread):
         inputs = self.processor(
             text=[self.conversation], 
             images=None, 
-            videos=list(queue), 
+            videos=[list(queue)], 
             padding=True, 
             return_tensors="pt", 
         ).to(self.model.device, self.model.dtype)
@@ -232,6 +292,8 @@ class InferenceWorker(QThread):
         return inference_text
 
     def run(self):
+        cap = None
+        out = None
         try:
             video_path = self.params['video_path']
             start_frame = self.params['start_frame']
@@ -313,23 +375,23 @@ class InferenceWorker(QThread):
                         "current_frame": current_frame_index - 1 + index + 1,
                         "text": "None"
                     })
-
-            cap.release()
-            out.close()
             
             if self.is_running:
                 self.finished_signal.emit(output_video_path, generated_texts)
-            del self.model
-            del self.processor
         except Exception as e:
             self.error_signal.emit(f"An error occurred during processing: {e}")
+        finally:
+            if cap: cap.release()
+            if out: out.close()
+            del self.model
+            del self.processor
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PyQt6 Video Inference Tool")
-        self.setGeometry(100, 100, 1400, 960)
+        self.setGeometry(100, 100, 1600, 900)
 
         self.video_path = None
         self.cap = None
@@ -354,7 +416,7 @@ class MainWindow(QMainWindow):
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_panel.setFixedWidth(600)
+        left_panel.setFixedWidth(650)
 
         file_group = QGroupBox("1. Video Loading")
         file_layout = QVBoxLayout()
@@ -394,7 +456,7 @@ class MainWindow(QMainWindow):
         self.sliding_window_spinbox.setRange(1, 100)
         self.sliding_window_spinbox.setValue(2)
         self.model_combo = QComboBox()
-        self.model_combo.addItems(["Qwen/Qwen2.5-VL-3B-Instruct", "Qwen/Qwen2.5-VL-7B-Instruct"])
+        self.model_combo.addItems(["Qwen/Qwen2.5-VL-3B-Instruct", "Qwen/Qwen2.5-VL-7B-Instruct", "llava-hf/llava-onevision-qwen2-0.5b-ov-hf", "llava-hf/llava-onevision-qwen2-7b-ov-hf", "HuggingFaceTB/SmolVLM2-256M-Video-Instruct", "HuggingFaceTB/SmolVLM2-500M-Video-Instruct", "HuggingFaceTB/SmolVLM2-2.2B-Instruct"])
         params_form_layout.addRow("Inference start frame:", start_frame_layout)
         params_form_layout.addRow("Inference end frame:", end_frame_layout)
         params_form_layout.addRow("FPS of the generated video:", self.fps_spinbox)
@@ -594,10 +656,10 @@ class MainWindow(QMainWindow):
                     gc.collect()
                 
                 print(f"Loading Processor...")
-                MIN_PIXELS = 224 * 28 * 28
-                MAX_PIXELS = 840 * 28 * 28
-                if MIN_PIXELS is not None and MAX_PIXELS is not None:
-                    if "Qwen2.5-VL" in desired_model_name:
+                if "Qwen2.5-VL" in desired_model_name:
+                    MIN_PIXELS = 224 * 28 * 28
+                    MAX_PIXELS = 840 * 28 * 28
+                    if MIN_PIXELS is not None and MAX_PIXELS is not None:
                         self.processor = AutoProcessor.from_pretrained(
                             desired_model_name, 
                             torch_dtype=torch.bfloat16,
@@ -605,23 +667,27 @@ class MainWindow(QMainWindow):
                             min_pixels=MIN_PIXELS, 
                             max_pixels=MAX_PIXELS, 
                         )
-                else:
-                    if "Qwen2.5-VL" in desired_model_name:
+                    else:
                         self.processor = AutoProcessor.from_pretrained(
                             desired_model_name, 
                             torch_dtype=torch.bfloat16,
                             trust_remote_code=True, 
                         )
+                else:
+                    self.processor = AutoProcessor.from_pretrained(
+                        desired_model_name, 
+                        torch_dtype=torch.bfloat16,
+                        trust_remote_code=True, 
+                    )
                 self.processor.tokenizer.padding_side  = "left"
                 
                 print(f"Loading new model: {desired_model_name}")
-                if "Qwen2.5-VL" in desired_model_name:
-                    self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                        desired_model_name, 
-                        torch_dtype=torch.bfloat16, 
-                        attn_implementation="flash_attention_2", 
-                        device_map="cuda:0", 
-                    ).eval()
+                self.model = MODEL_MAP[desired_model_name].from_pretrained(
+                    desired_model_name, 
+                    torch_dtype=torch.bfloat16, 
+                    attn_implementation="flash_attention_2", 
+                    device_map="cuda:0", 
+                ).eval()
 
                 self.current_model_name = desired_model_name
                 print(f"Successfully loaded {self.current_model_name}.")
@@ -710,7 +776,8 @@ class MainWindow(QMainWindow):
             else:
                 self.playback_timer.stop()
                 self.is_playing = False
-                self.play_pause_btn.setText("PLAY")
+                self.play_pause_btn.setText(" PLAY")
+                self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Rewind
                 self.display_frame(0)
                 self.playback_slider.setValue(0)
@@ -747,7 +814,7 @@ class MainWindow(QMainWindow):
         if self.current_video_source == 'processed' and self.inference_data:
             original_video_frame_number = self.inference_data[frame_number]["current_frame"]
             generated_text = self.inference_data[frame_number]["text"]
-            self.inference_text_display.setText(f"This frame {frame_number} corresponds to frame {original_video_frame_number} of the original video.\nGenerated Text: {generated_text}")
+            self.inference_text_display.setText(f"This frame {frame_number} corresponds to frame {original_video_frame_number} of the original video.\nGenerated Text:\n{generated_text}")
 
     def set_position(self, position):
         if self.is_playing:
@@ -783,8 +850,12 @@ class MainWindow(QMainWindow):
         if cap:
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.playback_slider.setRange(0, total_frames - 1)
+            self.frame_spinbox.setRange(0, total_frames - 1)
+            self.is_playing = False
+            self.playback_timer.stop()
+            self.play_pause_btn.setText(" PLAY")
+            self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
             self.display_frame(0)
-            self.playback_slider.setValue(0)
 
     def closeEvent(self, event):
         if self.worker_thread and self.worker_thread.isRunning():
