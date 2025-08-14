@@ -227,7 +227,7 @@ class InferenceWorker(QThread):
         font_size = 28
         padding = 10
         line_spacing = 10
-        text_area_height = 150
+        text_area_height = 160
         orig_w, orig_h = PIL_image.size
         new_h = orig_h + text_area_height
         new_img = Image.new("RGB", (orig_w, new_h), color=(34, 139, 34))
@@ -269,10 +269,10 @@ class InferenceWorker(QThread):
         Returns:
             inference_text (str): Generated Text.
         """
-        print(f"Processing Frame {curr_frame_number - frame_accumulation + 1} ~ Frame {curr_frame_number}")
-        print(f"Used Model Name: {model_name}")
-        print(f"System Prompt: {system_prompt}")
-        print(f"User Prompt: {user_prompt}")
+        # print(f"Processing Frame {curr_frame_number - frame_accumulation + 1} ~ Frame {curr_frame_number}")
+        # print(f"Used Model Name: {model_name}")
+        # print(f"System Prompt: {system_prompt}")
+        # print(f"User Prompt: {user_prompt}")
 
         inputs = self.processor(
             text=[self.conversation], 
@@ -288,7 +288,7 @@ class InferenceWorker(QThread):
             output_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
         inference_text = output_text[0]
 
-        print(f"The Results of Frame {curr_frame_number-1} and Frame {curr_frame_number}: {output_text[0]}")
+        # print(f"The Results of Frame {curr_frame_number-1} and Frame {curr_frame_number}: {output_text[0]}")
         return inference_text
 
     def run(self):
@@ -317,7 +317,7 @@ class InferenceWorker(QThread):
             output_dir = "inference_results"
             os.makedirs(output_dir, exist_ok=True)
             timestamp = time.strftime("%Y%m%d-%H%M%S")
-            output_filename = f"result_{os.path.basename(video_path)}_{timestamp}.mp4"
+            output_filename = f"result_{os.path.splitext(os.path.basename(video_path))[0]}_{timestamp}.mp4"
             output_video_path = os.path.join(output_dir, output_filename)
             out = imageio.get_writer(output_video_path, fps=output_fps)
 
