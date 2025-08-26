@@ -983,6 +983,7 @@ class MainWindow(QMainWindow):
         self.save_edited_btn.setEnabled(True)
 
         self.video_source_combo.setCurrentIndex(1)
+        self.switch_video_source("Edited Video")
     
     def reset_edits(self):
         self.cleanup_temp_files()
