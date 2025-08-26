@@ -7,14 +7,16 @@ import numpy as np
 import imageio
 import gc
 import textwrap
+import subprocess
+import shutil
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QSlider, QSpinBox, QComboBox, QTextEdit, QGroupBox,
-    QFormLayout, QMessageBox, QProgressBar, QStyle, QSizePolicy
+    QFormLayout, QMessageBox, QProgressBar, QStyle, QSizePolicy, QTabWidget, QColorDialog, QScrollArea
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QImage, QPixmap, QFont
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
+from PyQt6.QtGui import QImage, QPixmap, QColor
 from collections import deque
 from transformers import Qwen2_5_VLForConditionalGeneration, LlavaOnevisionForConditionalGeneration, AutoModelForImageTextToText, AutoTokenizer, AutoProcessor
 from qwen_vl_utils import process_vision_info
@@ -43,7 +45,6 @@ QGroupBox {
     margin-top: 1em;
     font-weight: bold;
 }
-
 QGroupBox::title {
     subcontrol-origin: margin;
     subcontrol-position: top center;
@@ -61,17 +62,14 @@ QPushButton {
     min-height: 20px;
     font-weight: bold;
 }
-
 QPushButton:hover {
     background-color: #404040;
     border: 1px solid #39ff14;
 }
-
 QPushButton:pressed {
     background-color: #39ff14;
     color: #1a1a1a; /* 按下時反色 */
 }
-
 QPushButton:disabled {
     background-color: #2a2a2a;
     color: #555555;
@@ -84,7 +82,6 @@ QTextEdit, QSpinBox, QComboBox {
     border-radius: 4px;
     padding: 5px;
 }
-
 QTextEdit:focus, QSpinBox:focus, QComboBox:focus {
     border: 1px solid #39ff14;
 }
@@ -137,7 +134,7 @@ QProgressBar::chunk {
 }
 
 /* 影片顯示標籤 */
-#VideoDisplayLabel {
+VideoDisplayLabel {
     background-color: black;
     border: 2px solid #242424;
     border-radius: 8px;
@@ -318,63 +315,64 @@ class InferenceWorker(QThread):
             os.makedirs(output_dir, exist_ok=True)
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             output_filename = f"result_{os.path.splitext(os.path.basename(video_path))[0]}_{timestamp}.mp4"
-            output_video_path = os.path.join(output_dir, output_filename)
-            out = imageio.get_writer(output_video_path, fps=output_fps)
+            output_video_path = os.path.join(output_dir, output_filename)            
 
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
             current_frame_index = start_frame
             queue = deque()
             generated_texts = []
+            
+            # The QThread signal may be executed first and then "finally", so you must use "with" to close the writer.
+            with imageio.get_writer(output_video_path, fps=output_fps) as out:
+                while self.is_running and current_frame_index <= end_frame:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
 
-            while self.is_running and current_frame_index <= end_frame:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+                    frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    queue.append(frame)
 
-                frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                queue.append(frame)
+                    if len(queue) >= frame_accumulation:
+                        inference_text = self.run_inference_on_frames(
+                            queue, system_prompt, user_prompt, model_name, current_frame_index, frame_accumulation
+                        )
 
-                if len(queue) >= frame_accumulation:
-                    inference_text = self.run_inference_on_frames(
-                        queue, system_prompt, user_prompt, model_name, current_frame_index, frame_accumulation
-                    )
+                        for index in range(-sliding_window_size, 0):
+                            image = self.frame_process(queue[index], inference_text)
+                            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                            out.append_data(image)
 
-                    for index in range(-sliding_window_size, 0):
-                        image = self.frame_process(queue[index], inference_text)
+                            generated_texts.append({
+                                "current_frame": current_frame_index + index + 1,
+                                "text": inference_text
+                            })
+                        
+                        for _ in range(sliding_window_size):
+                            queue.popleft()
+                    elif len(queue) <= frame_accumulation - sliding_window_size:
+                        image = self.frame_process(frame, "None")
                         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                         out.append_data(image)
 
                         generated_texts.append({
-                            "current_frame": current_frame_index + index + 1,
-                            "text": inference_text
+                            "current_frame": current_frame_index,
+                            "text": "None"
                         })
-                    
-                    for _ in range(sliding_window_size):
-                        queue.popleft()
-                elif len(queue) <= frame_accumulation - sliding_window_size:
-                    image = self.frame_process(frame, "None")
-                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                    out.append_data(image)
 
-                    generated_texts.append({
-                        "current_frame": current_frame_index,
-                        "text": "None"
-                    })
+                    current_frame_index += 1
+                    progress = int((current_frame_index - start_frame) / total_inference_frames * 100)
+                    self.progress_signal.emit(progress)
 
-                current_frame_index += 1
-                progress = int((current_frame_index - start_frame) / total_inference_frames * 100)
-                self.progress_signal.emit(progress)
+                if len(queue) > frame_accumulation - sliding_window_size:
+                    for index in range(-(len(queue) - frame_accumulation + sliding_window_size), 0):
+                        image = self.frame_process(queue[index], "None")
+                        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                        out.append_data(image)
 
-            if len(queue) > frame_accumulation - sliding_window_size:
-                for index in range(-(len(queue) - frame_accumulation + sliding_window_size), 0):
-                    image = self.frame_process(queue[index], "None")
-                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                    out.append_data(image)
-
-                    generated_texts.append({
-                        "current_frame": current_frame_index - 1 + index + 1,
-                        "text": "None"
-                    })
+                        generated_texts.append({
+                            "current_frame": current_frame_index - 1 + index + 1,
+                            "text": "None"
+                        })
             
             if self.is_running:
                 self.finished_signal.emit(output_video_path, generated_texts)
@@ -387,6 +385,99 @@ class InferenceWorker(QThread):
             del self.processor
 
 
+class VideoProcessingWorker(QThread):
+    progress_signal = pyqtSignal(int)
+    finished_signal = pyqtSignal(str) # output_path
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, params):
+        super().__init__()
+        self.params = params
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+        
+    def run(self):
+        operation = self.params.get('operation')
+        if operation == 'draw':
+            self.run_draw_operation()
+        else:
+            self.error_signal.emit(f"Unknown operation: {operation}")
+
+    def run_draw_operation(self):
+        input_path = self.params['input_path']
+        output_path = self.params['output_path']
+        shape = self.params['shape']
+        coords = self.params['coords']
+        color = self.params['color']
+        thickness = self.params['thickness']
+
+        cap = None
+        out = None
+        try:
+            cap = cv2.VideoCapture(input_path)
+            if not cap.isOpened():
+                self.error_signal.emit("Failed to open source video for drawing.")
+                return
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            # width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            # height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # The QThread signal may be executed first and then "finally", so you must use "with" to close the writer.
+            with imageio.get_writer(output_path, fps=fps) as out:
+                for i in range(total_frames):
+                    if not self.is_running:
+                        break
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    if shape == 'Rectangle':
+                        pt1 = (coords[0], coords[1])
+                        pt2 = (coords[0] + coords[2], coords[1] + coords[3])
+                        cv2.rectangle(frame, pt1, pt2, color, thickness)
+                    elif shape == 'Line':
+                        pt1 = (coords[0], coords[1])
+                        pt2 = (coords[2], coords[3])
+                        cv2.line(frame, pt1, pt2, color, thickness)
+                    
+                    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    out.append_data(image)
+                    progress = int((i + 1) / total_frames * 100)
+                    self.progress_signal.emit(progress)
+
+            if self.is_running:
+                self.finished_signal.emit(output_path)
+        except Exception as e:
+            self.error_signal.emit(f"Error during drawing operation: {e}")
+        finally:
+            if cap: cap.release()
+            if out: out.close()
+
+
+class VideoDisplayLabel(QLabel):
+    mouse_moved_signal = pyqtSignal(QPoint)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.original_video_size = None
+
+    def mouseMoveEvent(self, event):
+        self.mouse_moved_signal.emit(event.pos())
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self.setToolTip("")
+        super().leaveEvent(event)
+
+    def set_original_video_size(self, size):
+        self.original_video_size = size
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -395,13 +486,25 @@ class MainWindow(QMainWindow):
 
         self.video_path = None
         self.cap = None
+
+        self.edited_video_path = None
+        self.edited_cap = None
+        self.temp_dir = os.path.join(os.getcwd(), "video_modification_temp")
+        os.makedirs(self.temp_dir, exist_ok=True)
+
         self.processed_cap = None
+
+        self.drawing_color = QColor(Qt.GlobalColor.red)
         self.total_frames = 0
+        self.video_width = 0
+        self.video_height = 0
         self.playback_timer = QTimer(self)
         self.playback_timer.timeout.connect(self.update_frame)
         self.is_playing = False
-        self.current_video_source = 'original' # 'original' or 'processed'
-        self.worker_thread = None
+        self.current_video_source = 'original' # 'original', 'edited', 'processed'
+        
+        self.inference_worker = None
+        self.video_worker = None
         self.model = None
         self.processor = None
         self.current_model_name = None
@@ -414,6 +517,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
 
+        # Left UI
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_panel.setFixedWidth(650)
@@ -430,7 +534,90 @@ class MainWindow(QMainWindow):
         file_group.setLayout(file_layout)
         left_layout.addWidget(file_group)
 
-        params_group = QGroupBox("2. Inference Parameters Setting")
+        edit_group = QGroupBox("2. Video Editing Tools")
+        edit_layout = QVBoxLayout()
+        self.edit_tabs = QTabWidget()
+        self.edit_tabs.setEnabled(False)
+
+        crop_widget = QWidget()
+        crop_layout = QFormLayout(crop_widget)
+        self.crop_w_spin = QSpinBox()
+        self.crop_h_spin = QSpinBox()
+        self.crop_x_spin = QSpinBox()
+        self.crop_y_spin = QSpinBox()
+        self.apply_crop_btn = QPushButton("Apply Crop")
+        self.apply_crop_btn.clicked.connect(self.apply_crop)
+        crop_layout.addRow("Width:", self.crop_w_spin)
+        crop_layout.addRow("Height:", self.crop_h_spin)
+        crop_layout.addRow("X offset:", self.crop_x_spin)
+        crop_layout.addRow("Y offset:", self.crop_y_spin)
+        crop_layout.addRow(self.apply_crop_btn)
+
+        resize_widget = QWidget()
+        resize_layout = QFormLayout(resize_widget)
+        self.resize_w_spin = QSpinBox()
+        self.resize_w_spin.setRange(1, 3840)
+        self.resize_h_spin = QSpinBox()
+        self.resize_h_spin.setRange(1, 2160)
+        self.apply_resize_btn = QPushButton("Apply Resize")
+        self.apply_resize_btn.clicked.connect(self.apply_resize)
+        resize_layout.addRow("New Width:", self.resize_w_spin)
+        resize_layout.addRow("New Height:", self.resize_h_spin)
+        resize_layout.addRow(self.apply_resize_btn)
+
+        draw_widget = QWidget()
+        draw_layout = QFormLayout(draw_widget)
+        self.draw_shape_combo = QComboBox()
+        self.draw_shape_combo.addItems(["Rectangle", "Line"])
+        self.draw_x1_spin = QSpinBox()
+        self.draw_y1_spin = QSpinBox()
+        self.draw_x2_width_spin = QSpinBox()
+        self.draw_y2_height_spin = QSpinBox()
+        self.draw_thickness_spin = QSpinBox()
+        self.draw_thickness_spin.setRange(1, 100)
+        self.draw_thickness_spin.setValue(2)
+        
+        color_layout = QHBoxLayout()
+        self.pick_color_btn = QPushButton("Pick Color")
+        self.pick_color_btn.clicked.connect(self.pick_draw_color)
+        self.color_preview_label = QLabel()
+        self.color_preview_label.setFixedSize(50, 20)
+        self.update_color_preview()
+        color_layout.addWidget(self.pick_color_btn)
+        color_layout.addWidget(self.color_preview_label)
+        
+        self.apply_draw_btn = QPushButton("Apply Drawing")
+        self.apply_draw_btn.clicked.connect(self.apply_drawing)
+        
+        draw_layout.addRow("Shape:", self.draw_shape_combo)
+        draw_layout.addRow("X1(Top-Left)/X1:", self.draw_x1_spin)
+        draw_layout.addRow("Y1(Top-Left)/Y1:", self.draw_y1_spin)
+        draw_layout.addRow("Width/X2:", self.draw_x2_width_spin)
+        draw_layout.addRow("Height/Y2:", self.draw_y2_height_spin)
+        draw_layout.addRow("Thickness:", self.draw_thickness_spin)
+        draw_layout.addRow(color_layout)
+        draw_layout.addRow(self.apply_draw_btn)
+        
+        self.edit_tabs.addTab(crop_widget, "Crop")
+        self.edit_tabs.addTab(resize_widget, "Resize")
+        self.edit_tabs.addTab(draw_widget, "Draw")
+        
+        edit_buttons_layout = QHBoxLayout()
+        self.save_edited_btn = QPushButton("Save Edited Video As...")
+        self.save_edited_btn.clicked.connect(self.save_edited_video)
+        self.save_edited_btn.setEnabled(False)
+        self.reset_edits_btn = QPushButton("Reset All Edits")
+        self.reset_edits_btn.clicked.connect(self.reset_edits)
+        self.reset_edits_btn.setEnabled(False)
+        edit_buttons_layout.addWidget(self.save_edited_btn)
+        edit_buttons_layout.addWidget(self.reset_edits_btn)
+        
+        edit_layout.addWidget(self.edit_tabs)
+        edit_layout.addLayout(edit_buttons_layout)
+        edit_group.setLayout(edit_layout)
+        left_layout.addWidget(edit_group)
+
+        params_group = QGroupBox("3. Inference Parameters Setting")
         params_form_layout = QFormLayout()
         self.start_frame_slider = QSlider(Qt.Orientation.Horizontal)
         self.start_frame_slider.setEnabled(False)
@@ -466,14 +653,16 @@ class MainWindow(QMainWindow):
         params_group.setLayout(params_form_layout)
         left_layout.addWidget(params_group)
 
-        prompt_group = QGroupBox("3. Model Prompt")
+        prompt_group = QGroupBox("4. Model Prompt")
         prompt_layout = QVBoxLayout()
         self.system_prompt_edit = QTextEdit()
         self.system_prompt_edit.setPlaceholderText("Please input system prompt...")
         self.system_prompt_edit.setText("You are a helpful assistant.")
+        self.system_prompt_edit.setMaximumHeight(120)
         self.user_prompt_edit = QTextEdit()
         self.user_prompt_edit.setPlaceholderText("Please input user prompt...")
         self.user_prompt_edit.setText("Describe the video.")
+        self.user_prompt_edit.setMaximumHeight(120)
         prompt_layout.addWidget(QLabel("System Prompt:"))
         prompt_layout.addWidget(self.system_prompt_edit)
         prompt_layout.addWidget(QLabel("User Prompt:"))
@@ -481,35 +670,46 @@ class MainWindow(QMainWindow):
         prompt_group.setLayout(prompt_layout)
         left_layout.addWidget(prompt_group)
 
-        action_group = QGroupBox("4. Execute and Results")
-        action_layout = QVBoxLayout()
+        action_group = QGroupBox("5. Execute and Results")
+        action_layout = QFormLayout()
+        self.inference_source_combo = QComboBox()
+        self.inference_source_combo.addItems(["Original Video", "Edited Video"])
+        self.inference_source_combo.setEnabled(False)
+        action_layout.addRow("Inference Source:", self.inference_source_combo)
         self.start_inference_btn = QPushButton("Start to Infer")
         self.start_inference_btn.setEnabled(False)
         self.start_inference_btn.clicked.connect(self.start_inference)
+        action_layout.addRow(self.start_inference_btn)
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
+        action_layout.addRow(self.progress_bar)
+        self.status_label = QLabel("")
+        action_layout.addRow(self.status_label)
         self.inference_text_label = QLabel("The Inference Result of Current Frame:")
         self.inference_text_display = QTextEdit()
         self.inference_text_display.setReadOnly(True)
         self.inference_text_display.setPlaceholderText("When playing the inferred video, the corresponding generated text will be displayed here...")
-        action_layout.addWidget(self.start_inference_btn)
-        action_layout.addWidget(self.progress_bar)
-        action_layout.addWidget(self.inference_text_label)
-        action_layout.addWidget(self.inference_text_display)
+        self.inference_text_display.setMaximumHeight(120)
+        action_layout.addRow(self.inference_text_label)
+        action_layout.addRow(self.inference_text_display)
         action_group.setLayout(action_layout)
         left_layout.addWidget(action_group)
         
         left_layout.addStretch()
-        main_layout.addWidget(left_panel)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(left_panel)
+        main_layout.addWidget(scroll_area)
 
+        # Right UI
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         
-        self.video_display_label = QLabel("Please load a video first.")
+        self.video_display_label = VideoDisplayLabel("Please load a video first.")
         self.video_display_label.setObjectName("VideoDisplayLabel")
         self.video_display_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_display_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        # self.video_display_label.setStyleSheet("background-color: black; color: white;")
+        self.video_display_label.mouse_moved_signal.connect(self.update_pixel_coords)
         
         slider_spinbox_hbox = QHBoxLayout()
         playback_slider_group = QWidget()
@@ -552,7 +752,7 @@ class MainWindow(QMainWindow):
         self.video_time_label = QLabel("00:00 / 00:00")
         
         self.video_source_combo = QComboBox()
-        self.video_source_combo.addItems(["Original Video", "Inferred Video"])
+        self.video_source_combo.addItems(["Original Video", "Edited Video", "Inferred Video"])
         self.video_source_combo.setEnabled(False)
         self.video_source_combo.currentTextChanged.connect(self.switch_video_source)
 
@@ -566,47 +766,267 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(playback_slider_group)
         right_layout.addLayout(playback_controls)
         main_layout.addWidget(right_panel, 1)
+    
+    def update_pixel_coords(self, pos):
+        if not self.video_display_label.pixmap() or self.video_display_label.pixmap().isNull():
+            return
+        
+        label_size = self.video_display_label.size()
+        pixmap_size = self.video_display_label.pixmap().size()
+        
+        if self.video_width == 0 or self.video_height == 0:
+            return
+
+        scale_x = label_size.width() / self.video_width
+        scale_y = label_size.height() / self.video_height
+        scale = min(scale_x, scale_y)
+        scaled_w = int(self.video_width * scale)
+        scaled_h = int(self.video_height * scale)
+        offset_x = (label_size.width() - scaled_w) // 2
+        offset_y = (label_size.height() - scaled_h) // 2
+        relative_x = pos.x() - offset_x
+        relative_y = pos.y() - offset_y
+
+        if 0 <= relative_x <= scaled_w and 0 <= relative_y <= scaled_h:
+            px = int(relative_x / scale)
+            py = int(relative_y / scale)
+            self.video_display_label.setToolTip(f"({px}, {py})")
+        else:
+            self.video_display_label.setToolTip("")
+    
+    def cleanup_temp_files(self):
+        if self.edited_video_path and os.path.exists(self.edited_video_path):
+            try:
+                os.remove(self.edited_video_path)
+            except OSError as e:
+                print(f"Error removing temp file {self.edited_video_path}: {e}")
+        self.edited_video_path = None
 
     def load_video(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choose A Video File", "", "Video Files (*.mp4 *.avi *.mov)")
-        if path:
-            self.video_path = path
-            self.video_path_label.setText(os.path.basename(path))
+        if not path:
+            return
+        
+        self.video_path = path
+        self.video_path_label.setText(os.path.basename(path))
 
-            if self.cap: self.cap.release()
-            if self.processed_cap: self.processed_cap.release()
-            self.processed_cap = None
+        self.reset_all_caps()
+        self.cleanup_temp_files()
+        self.inference_data = []
+        self.inference_text_display.clear()
+        
+        self.cap = cv2.VideoCapture(self.video_path)
+        if not self.cap.isOpened():
+            QMessageBox.critical(self, "ERROR", "The video file can't be opened.")
+            self.video_path = None
+            return
 
-            self.inference_data = []
-            self.inference_text_display.clear()
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.original_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.video_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.video_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.video_display_label.set_original_video_size(QPoint(self.video_width, self.video_height))
+
+        for spin in [self.crop_w_spin, self.crop_h_spin, self.crop_x_spin, self.crop_y_spin, 
+                     self.draw_x1_spin, self.draw_x2_width_spin]:
+            spin.setRange(0, self.video_width)
+        for spin in [self.draw_y1_spin, self.draw_y2_height_spin]:
+            spin.setRange(0, self.video_height)
             
-            self.cap = cv2.VideoCapture(self.video_path)
-            if not self.cap.isOpened():
-                QMessageBox.critical(self, "ERROR", "The video file can't be opened.")
-                return
+        self.crop_w_spin.setValue(self.video_width)
+        self.crop_h_spin.setValue(self.video_height)
+        self.resize_w_spin.setValue(self.video_width)
+        self.resize_h_spin.setValue(self.video_height)
 
-            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.original_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.start_frame_slider.setRange(0, self.total_frames - 1)
+        self.start_frame_slider.setValue(0)
+        self.end_frame_slider.setRange(0, self.total_frames - 1)
+        self.end_frame_slider.setValue(self.total_frames - 1)
+        self.playback_slider.setRange(0, self.total_frames - 1)
+        self.frame_spinbox.setRange(0, self.total_frames - 1)
+        self.frame_spinbox.setValue(0)
+        
+        self.start_frame_slider.setEnabled(True)
+        self.end_frame_slider.setEnabled(True)
+        self.playback_slider.setEnabled(True)
+        self.frame_spinbox.setEnabled(True)
+        self.start_inference_btn.setEnabled(True)
+        self.play_pause_btn.setEnabled(True)
+        self.edit_tabs.setEnabled(True)
+        self.reset_edits_btn.setEnabled(False)
+        self.save_edited_btn.setEnabled(False)
+        
+        self.video_source_combo.model().item(1).setEnabled(False) # Disable "Edited Video"
+        self.video_source_combo.model().item(2).setEnabled(False) # Disable "Inferred Video"
+        self.inference_source_combo.model().item(1).setEnabled(False)
+        self.video_source_combo.setCurrentIndex(0)
+        self.inference_source_combo.setCurrentIndex(0)
+        self.video_source_combo.setEnabled(True)
+        self.inference_source_combo.setEnabled(True)
 
-            self.start_frame_slider.setRange(0, self.total_frames - 1)
-            self.start_frame_slider.setValue(0)
-            self.end_frame_slider.setRange(0, self.total_frames - 1)
-            self.end_frame_slider.setValue(self.total_frames - 1)
-            self.playback_slider.setRange(0, self.total_frames - 1)
-            self.frame_spinbox.setValue(0)
-            self.frame_spinbox.setRange(0, self.total_frames - 1)
-            
-            self.start_frame_slider.setEnabled(True)
-            self.end_frame_slider.setEnabled(True)
-            self.playback_slider.setEnabled(True)
-            self.frame_spinbox.setEnabled(True)
-            self.start_inference_btn.setEnabled(True)
-            self.play_pause_btn.setEnabled(True)
-            self.video_source_combo.setCurrentIndex(0)
-            self.video_source_combo.setEnabled(False)
+        self.current_video_source = 'original'
+        self.switch_video_source("Original Video")
 
-            self.current_video_source = 'original'
-            self.switch_video_source("Original Video")
+    def get_current_editing_source_path(self):
+        return self.edited_video_path if self.edited_video_path and os.path.exists(self.edited_video_path) else self.video_path
+
+    def run_ffmpeg_command(self, command):
+        self.set_ui_enabled(False, "Processing video...")
+        try:
+            subprocess.run(command, check=True, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return True
+        except subprocess.CalledProcessError as e:
+            QMessageBox.critical(self, "FFmpeg Error", f"An error occurred: {e.stderr.decode()}")
+            return False
+        finally:
+            self.set_ui_enabled(True)
+
+    def apply_crop(self):
+        source_path = self.get_current_editing_source_path()
+        if not source_path: return
+        
+        w = self.crop_w_spin.value()
+        h = self.crop_h_spin.value()
+        x = self.crop_x_spin.value()
+        y = self.crop_y_spin.value()
+
+        output_path = os.path.join(self.temp_dir, f"edited_{str(time.time()).replace('.', '_')}.mp4")
+        command = f'ffmpeg -i "{source_path}" -vf "crop={w}:{h}:{x}:{y}" -c:a copy "{output_path}" -y'
+        
+        if self.run_ffmpeg_command(command):
+            self.update_after_edit(output_path)
+
+    def apply_resize(self):
+        source_path = self.get_current_editing_source_path()
+        if not source_path: return
+
+        w = self.resize_w_spin.value()
+        h = self.resize_h_spin.value()
+        
+        output_path = os.path.join(self.temp_dir, f"edited_{str(time.time()).replace('.', '_')}.mp4")
+        command = f'ffmpeg -i "{source_path}" -vf scale={w}:{h} -c:a copy "{output_path}" -y'
+
+        if self.run_ffmpeg_command(command):
+            self.update_after_edit(output_path)
+
+    def pick_draw_color(self):
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.drawing_color = color
+            self.update_color_preview()
+
+    def update_color_preview(self):
+        pixmap = QPixmap(self.color_preview_label.size())
+        pixmap.fill(self.drawing_color)
+        self.color_preview_label.setPixmap(pixmap)
+
+    def apply_drawing(self):
+        source_path = self.get_current_editing_source_path()
+        if not source_path: return
+        
+        if self.video_worker and self.video_worker.isRunning():
+            QMessageBox.warning(self, "Busy", "Another video processing task is already running.")
+            return
+
+        output_path = os.path.join(self.temp_dir, f"edited_{str(time.time()).replace('.', '_')}.mp4")
+        
+        params = {
+            'operation': 'draw',
+            'input_path': source_path,
+            'output_path': output_path,
+            'shape': self.draw_shape_combo.currentText(),
+            'coords': (self.draw_x1_spin.value(), self.draw_y1_spin.value(), 
+                       self.draw_x2_width_spin.value(), self.draw_y2_height_spin.value()),
+            'color': (self.drawing_color.blue(), self.drawing_color.green(), self.drawing_color.red()), # BGR for OpenCV
+            'thickness': self.draw_thickness_spin.value()
+        }
+        
+        self.set_ui_enabled(False, "Applying drawing...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        
+        self.video_worker = VideoProcessingWorker(params)
+        self.video_worker.progress_signal.connect(self.update_progress)
+        self.video_worker.finished_signal.connect(self.video_processing_finished)
+        self.video_worker.error_signal.connect(self.video_processing_error)
+        self.video_worker.start()
+
+    def video_processing_finished(self, output_path):
+        self.set_ui_enabled(True)
+        self.progress_bar.setVisible(False)
+        self.update_after_edit(output_path)
+
+    def video_processing_error(self, error_message):
+        self.set_ui_enabled(True)
+        self.progress_bar.setVisible(False)
+        QMessageBox.critical(self, "Processing Error", error_message)
+
+    def update_after_edit(self, new_edited_path):
+        self.cleanup_temp_files()
+        self.edited_video_path = new_edited_path
+        
+        if self.edited_cap and self.edited_cap.isOpened():
+            self.edited_cap.release()
+        
+        self.edited_cap = cv2.VideoCapture(self.edited_video_path)
+        if not self.edited_cap.isOpened():
+            QMessageBox.critical(self, "Error", "Failed to open the edited video.")
+            self.edited_video_path = None
+            return
+
+        self.video_width = int(self.edited_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.video_height = int(self.edited_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        self.video_source_combo.model().item(1).setEnabled(True) # "Edited Video"
+        self.inference_source_combo.model().item(1).setEnabled(True)
+        self.reset_edits_btn.setEnabled(True)
+        self.save_edited_btn.setEnabled(True)
+
+        self.video_source_combo.setCurrentIndex(1)
+    
+    def reset_edits(self):
+        self.cleanup_temp_files()
+        if self.edited_cap:
+            self.edited_cap.release()
+            self.edited_cap = None
+        
+        self.video_source_combo.model().item(1).setEnabled(False)
+        self.inference_source_combo.model().item(1).setEnabled(False)
+        self.reset_edits_btn.setEnabled(False)
+        self.save_edited_btn.setEnabled(False)
+        
+        self.video_source_combo.setCurrentIndex(0)
+        QMessageBox.information(self, "Success", "All edits have been reset.")
+
+    def save_edited_video(self):
+        if not self.edited_video_path or not os.path.exists(self.edited_video_path):
+            QMessageBox.warning(self, "No Video", "There is no edited video to save.")
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save Edited Video", "", "MP4 Video (*.mp4)")
+        if save_path:
+            try:
+                shutil.copy(self.edited_video_path, save_path)
+                QMessageBox.information(self, "Success", f"Edited video saved to:\n{save_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Save Error", f"Could not save the file: {e}")
+
+    def set_ui_enabled(self, enabled, status_text=""):
+        self.edit_tabs.setEnabled(enabled)
+        self.load_video_btn.setEnabled(enabled)
+        self.start_inference_btn.setEnabled(enabled)
+        self.save_edited_btn.setEnabled(enabled and self.edited_video_path is not None)
+        self.reset_edits_btn.setEnabled(enabled and self.edited_video_path is not None)
+        self.status_label.setText(status_text)
+        QApplication.processEvents()
+
+    def reset_all_caps(self):
+        if self.cap: self.cap.release()
+        if self.edited_cap: self.edited_cap.release()
+        if self.processed_cap: self.processed_cap.release()
+        self.cap = None
+        self.edited_cap = None
+        self.processed_cap = None
     
     def update_start_frame_label(self, value):
         self.start_frame_label.setText(str(value))
@@ -623,8 +1043,17 @@ class MainWindow(QMainWindow):
         self.end_frame_slider.setValue(current_pos)
 
     def start_inference(self):
-        if not self.video_path:
-            QMessageBox.warning(self, "Warning", "Please load a video first.")
+        inference_source = self.inference_source_combo.currentText()
+        if inference_source == "Original Video":
+            inference_video_path = self.video_path
+        elif inference_source == "Edited Video":
+            inference_video_path = self.edited_video_path
+        else:
+            QMessageBox.critical(self, "Error", "Invalid inference source.")
+            return
+            
+        if not inference_video_path or not os.path.exists(inference_video_path):
+            QMessageBox.critical(self, "Error", f"The selected video for inference does not exist: {inference_source}")
             return
         
         start_frame = self.start_frame_slider.value()
@@ -642,8 +1071,7 @@ class MainWindow(QMainWindow):
         desired_model_name = self.model_combo.currentText()
         if self.current_model_name != desired_model_name:
             print(f"Model switch required. From '{self.current_model_name}' to '{desired_model_name}'.")
-            self.start_inference_btn.setEnabled(False)
-            self.start_inference_btn.setText("Switching The Model...")
+            self.set_ui_enabled(False, "Switching model...")
             QApplication.processEvents()
 
             try:
@@ -693,15 +1121,16 @@ class MainWindow(QMainWindow):
                 print(f"Successfully loaded {self.current_model_name}.")
             except Exception as e:
                 QMessageBox.critical(self, "Model Loading Error", f"Unable to load model: {e}")
-                self.start_inference_btn.setText("Start to Infer")
-                self.start_inference_btn.setEnabled(True)
+                self.set_ui_enabled(True)
                 self.model = None
                 self.processor = None
                 self.current_model_name = None
                 return
+            finally:
+                self.set_ui_enabled(True)
 
         params = {
-            'video_path': self.video_path,
+            'video_path': inference_video_path,
             'start_frame': start_frame,
             'end_frame': end_frame,
             'output_fps': self.fps_spinbox.value(),
@@ -712,24 +1141,22 @@ class MainWindow(QMainWindow):
             'model_name': self.model_combo.currentText(),
         }
 
-        self.start_inference_btn.setText("Inference In Progress...")
-        self.start_inference_btn.setEnabled(False)
+        self.set_ui_enabled(False, "Inference in progress...")
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
 
-        self.worker_thread = InferenceWorker(params, self.model, self.processor)
-        self.worker_thread.progress_signal.connect(self.update_progress)
-        self.worker_thread.finished_signal.connect(self.inference_finished)
-        self.worker_thread.error_signal.connect(self.inference_error)
-        self.worker_thread.start()
+        self.inference_worker = InferenceWorker(params, self.model, self.processor)
+        self.inference_worker.progress_signal.connect(self.update_progress)
+        self.inference_worker.finished_signal.connect(self.inference_finished)
+        self.inference_worker.error_signal.connect(self.inference_error)
+        self.inference_worker.start()
 
     def update_progress(self, value):
         self.progress_bar.setValue(value)
 
     def inference_finished(self, output_video_path, generated_texts):
         self.progress_bar.setVisible(False)
-        self.start_inference_btn.setEnabled(True)
-        self.start_inference_btn.setText("Start to Infer")
+        self.set_ui_enabled(True)
         QMessageBox.information(self, "Finish", f"The video inference is completed!\nThe result is saved in:\n{output_video_path}")
 
         self.inference_data = generated_texts
@@ -739,15 +1166,12 @@ class MainWindow(QMainWindow):
             self.processed_cap = None
         self.processed_cap = cv2.VideoCapture(output_video_path)
         if self.processed_cap.isOpened():
-            self.video_source_combo.setEnabled(True)
-            self.video_source_combo.setCurrentIndex(1)
-
-        self.switch_video_source("Inferred Video")
+            self.video_source_combo.model().item(2).setEnabled(True)
+            self.video_source_combo.setCurrentIndex(2)
 
     def inference_error(self, error_message):
         self.progress_bar.setVisible(False)
-        self.start_inference_btn.setEnabled(True)
-        self.start_inference_btn.setText("Start to Infer")
+        self.set_ui_enabled(True)
         QMessageBox.critical(self, "Inference Error", error_message)
 
     def toggle_play_pause(self):
@@ -790,6 +1214,9 @@ class MainWindow(QMainWindow):
         self.display_frame(frame_to_jump)
 
     def display_frame(self, frame_number, frame=None):
+        if self.is_playing is False:
+            self.playback_slider.setValue(frame_number)
+
         if frame is None:
             cap = self.get_current_cap()
             if not cap: return
@@ -806,15 +1233,16 @@ class MainWindow(QMainWindow):
         self.video_display_label.setPixmap(scaled_pixmap)
 
         self.update_time_label(frame_number)
-        self.playback_slider.setValue(frame_number)
         self.frame_spinbox.blockSignals(True)
         self.frame_spinbox.setValue(frame_number)
         self.frame_spinbox.blockSignals(False)
 
-        if self.current_video_source == 'processed' and self.inference_data:
+        if self.current_video_source == 'processed' and self.inference_data and frame_number < len(self.inference_data):
             original_video_frame_number = self.inference_data[frame_number]["current_frame"]
             generated_text = self.inference_data[frame_number]["text"]
             self.inference_text_display.setText(f"This frame {frame_number} corresponds to frame {original_video_frame_number} of the original video.\nGenerated Text:\n{generated_text}")
+        elif self.current_video_source != 'processed':
+            self.inference_text_display.clear()
 
     def set_position(self, position):
         if self.is_playing:
@@ -824,7 +1252,7 @@ class MainWindow(QMainWindow):
 
     def update_time_label(self, frame_number):
         cap = self.get_current_cap()
-        if cap:
+        if cap and cap.isOpened():
             fps = cap.get(cv2.CAP_PROP_FPS)
             if fps == 0: fps = self.original_fps # Fallback for processed video
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -837,30 +1265,39 @@ class MainWindow(QMainWindow):
     def get_current_cap(self):
         if self.current_video_source == 'processed' and self.processed_cap and self.processed_cap.isOpened():
             return self.processed_cap
+        elif self.current_video_source == 'edited' and self.edited_cap and self.edited_cap.isOpened():
+            return self.edited_cap
         return self.cap
     
     def switch_video_source(self, source_text):
-        self.current_video_source = 'processed' if source_text == 'Inferred Video' else 'original'
-        is_original_video = (self.current_video_source == 'original')
-        self.set_start_btn.setEnabled(is_original_video)
-        self.set_end_btn.setEnabled(is_original_video)
-        self.inference_text_display.clear()
+        source_map = {"Original Video": 'original', "Edited Video": 'edited', "Inferred Video": 'processed'}
+        self.current_video_source = source_map.get(source_text, 'original')
+
+        is_original_edited_video = (self.current_video_source == 'original' or self.current_video_source == 'edited')
+        self.set_start_btn.setEnabled(is_original_edited_video)
+        self.set_end_btn.setEnabled(is_original_edited_video)
         
         cap = self.get_current_cap()
-        if cap:
+        if cap and cap.isOpened():
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.playback_slider.setRange(0, total_frames - 1)
             self.frame_spinbox.setRange(0, total_frames - 1)
-            self.is_playing = False
-            self.playback_timer.stop()
-            self.play_pause_btn.setText(" PLAY")
-            self.play_pause_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+            if self.is_playing: self.toggle_play_pause()
             self.display_frame(0)
+        else:
+            if self.current_video_source != 'original':
+                QMessageBox.warning(self, "Warning", f"{source_text} is not available. Switching back to Original Video.")
+                self.video_source_combo.setCurrentIndex(0)
+            else:
+                 self.video_display_label.setText("Video not available.")
 
     def closeEvent(self, event):
-        if self.worker_thread and self.worker_thread.isRunning():
-            self.worker_thread.stop()
-            self.worker_thread.wait()
+        if self.inference_worker and self.inference_worker.isRunning():
+            self.inference_worker.stop()
+            self.inference_worker.wait()
+        if self.video_worker and self.video_worker.isRunning():
+            self.video_worker.stop()
+            self.video_worker.wait()
         if self.model is not None:
             print(f"Releasing model {self.current_model_name} on exit.")
             del self.model
@@ -868,8 +1305,12 @@ class MainWindow(QMainWindow):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             gc.collect()
-        if self.cap: self.cap.release()
-        if self.processed_cap: self.processed_cap.release()
+        self.reset_all_caps()
+        try:
+            shutil.rmtree(self.temp_dir)
+            print(f"Removed temporary directory: {self.temp_dir}")
+        except Exception as e:
+            print(f"Error removing temporary directory: {e}")
         event.accept()
 
 if __name__ == "__main__":
