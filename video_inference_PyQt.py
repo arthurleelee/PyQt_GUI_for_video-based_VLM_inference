@@ -6,9 +6,10 @@ import torch
 import numpy as np
 import imageio
 import gc
-import textwrap
 import subprocess
 import shutil
+import math
+import torchvision.transforms as T
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -18,9 +19,11 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt6.QtGui import QImage, QPixmap, QColor
 from collections import deque
-from transformers import Qwen2_5_VLForConditionalGeneration, LlavaOnevisionForConditionalGeneration, AutoModelForImageTextToText, AutoTokenizer, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, LlavaOnevisionForConditionalGeneration, AutoModelForImageTextToText, AutoTokenizer, AutoProcessor, AutoModel
 from qwen_vl_utils import process_vision_info
 from PIL import ImageFont, Image, ImageDraw
+from torchvision.transforms.functional import InterpolationMode
+from scipy.spatial import cKDTree
 
 
 STYLE_SHEET = """
@@ -150,6 +153,11 @@ MODEL_MAP = {
     "HuggingFaceTB/SmolVLM2-256M-Video-Instruct": AutoModelForImageTextToText, 
     "HuggingFaceTB/SmolVLM2-500M-Video-Instruct": AutoModelForImageTextToText, 
     "HuggingFaceTB/SmolVLM2-2.2B-Instruct": AutoModelForImageTextToText,
+    "OpenGVLab/InternVL3_5-1B": AutoModel,
+    "OpenGVLab/InternVL3_5-2B": AutoModel,
+    "OpenGVLab/InternVL3_5-4B": AutoModel,
+    "OpenGVLab/InternVL3_5-8B": AutoModel,
+    "openbmb/MiniCPM-V-4_5": AutoModel,
 }
 
 
@@ -158,67 +166,95 @@ class InferenceWorker(QThread):
     finished_signal = pyqtSignal(str, list) # (output_video_path, generated_texts)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, params, model, processor):
+    def __init__(self, params, model, processor=None, tokenizer=None):
         super().__init__()
         self.params = params
         self.is_running = True
         self.model = model
         self.processor = processor
+        self.tokenizer = tokenizer
         self.conversation = None
 
         print("--- Loading Conversation Template. ---")
-        if "Qwen2.5-VL" in self.params['model_name'] or "llava-onevision-qwen2" in self.params['model_name']:
-            conversation = [
-                {
-                    "role":"system",
-                    "content":[
-                        {
-                            "type": "text",
-                            "text": self.params['system_prompt']
-                        }
-                    ]
-                }, 
-                {
-                    "role":"user",
-                    "content":[
-                        {
-                            "type": "video",
-                        },
-                        {
-                            "type": "text",
-                            "text": self.params['user_prompt']
-                        }
-                    ]
-                }
-            ]
+        print("self.params['model_name']: ", self.params['model_name'])
+        if "InternVL3_5" in self.params['model_name']:
+            video_prefix = ''.join([f'Frame{i+1}: <image>\n' for i in range(self.params['frame_accumulation'])])
+            self.conversation = video_prefix + self.params['user_prompt']
+            self.model.system_message = self.params['system_prompt']
+        elif "MiniCPM-V-4_5" in self.params['model_name']:
+            pass
         else:
-            # Actually, these model will directly convert the video into the multiple images without any time handling.
-            conversation = [
-                {
-                    "role":"system",
-                    "content":[
-                        {
-                            "type": "text",
-                            "text": self.params['system_prompt']
-                        }
-                    ]
-                }, 
-                {
-                    "role":"user",
-                    "content":[{"type": "image",} for _ in range(self.params['frame_accumulation'])] + [
-                        {
-                            "type": "text",
-                            "text": self.params['user_prompt']
-                        }
-                    ]
-                }
-            ]
+            if (
+                "Qwen2.5-VL" in self.params['model_name'] or 
+                "llava-onevision-qwen2" in self.params['model_name']
+            ):
+                conversation = [
+                    {
+                        "role":"system",
+                        "content":[
+                            {
+                                "type": "text",
+                                "text": self.params['system_prompt']
+                            }
+                        ]
+                    }, 
+                    {
+                        "role":"user",
+                        "content":[
+                            {
+                                "type": "video",
+                            },
+                            {
+                                "type": "text",
+                                "text": self.params['user_prompt']
+                            }
+                        ]
+                    }
+                ]
+            else:
+                # Actually, these model will directly convert the video into the multiple images without any time handling.
+                conversation = [
+                    {
+                        "role":"system",
+                        "content":[
+                            {
+                                "type": "text",
+                                "text": self.params['system_prompt']
+                            }
+                        ]
+                    }, 
+                    {
+                        "role":"user",
+                        "content":[{"type": "image",} for _ in range(self.params['frame_accumulation'])] + [
+                            {
+                                "type": "text",
+                                "text": self.params['user_prompt']
+                            }
+                        ]
+                    }
+                ]
 
-        self.conversation = self.processor.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=True
-        )
+            self.conversation = self.processor.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True
+            )
         print("--- Complete Conversation Template. ---")
 
+    def wrap_text_pixelwise(self, text, font, max_width):
+        lines = []
+        for para in text.split('\n'):
+            words = para.split()
+            line = ""
+            for word in words:
+                test_line = f"{line} {word}".strip()
+                width = font.getlength(test_line)
+                if width <= max_width:
+                    line = test_line
+                else:
+                    lines.append(line)
+                    line = word
+            lines.append(line)
+        return lines
+    
     def frame_process(self, PIL_image, text):
         font_path = "./Bitcount_Prop_Single/static/BitcountPropSingle_Roman-SemiBold.ttf"
         font_size = 28
@@ -230,11 +266,8 @@ class InferenceWorker(QThread):
         new_img = Image.new("RGB", (orig_w, new_h), color=(34, 139, 34))
         new_img.paste(PIL_image, (0, 0))
         draw = ImageDraw.Draw(new_img)
-        font = ImageFont.truetype(font_path, font_size)
-        wrapped_lines = []
-        for para in text.split("\n"):
-            wrapped = textwrap.fill(para, width=orig_w - 40)
-            wrapped_lines.extend(wrapped.split("\n"))
+        font = ImageFont.truetype(font_path, font_size) 
+        wrapped_lines = self.wrap_text_pixelwise(text, font, orig_w - 2 * padding)
         text_x = padding
         text_y = orig_h + padding
         for line in wrapped_lines:
@@ -250,44 +283,193 @@ class InferenceWorker(QThread):
         # cv2.rectangle(cv2_image, (10, 30 - text_h - 5), (10 + text_w, 30 + baseline), (34, 139, 34, 0.5), -1)
         # cv2.putText(cv2_image, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
         return cv2_image
-    
-    def stop(self):
-        self.is_running = False
 
-    def run_inference_on_frames(self, queue, system_prompt, user_prompt, model_name, curr_frame_number, frame_accumulation):
+    def build_transform(self, input_size):
+        IMAGENET_MEAN = (0.485, 0.456, 0.406)
+        IMAGENET_STD = (0.229, 0.224, 0.225)
+        MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
+        transform = T.Compose([
+            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+            T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=MEAN, std=STD)
+        ])
+        return transform
+
+    def find_closest_aspect_ratio(self, aspect_ratio, target_ratios, width, height, image_size):
+        best_ratio_diff = float('inf')
+        best_ratio = (1, 1)
+        area = width * height
+        for ratio in target_ratios:
+            target_aspect_ratio = ratio[0] / ratio[1]
+            ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+            if ratio_diff < best_ratio_diff:
+                best_ratio_diff = ratio_diff
+                best_ratio = ratio
+            elif ratio_diff == best_ratio_diff:
+                if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                    best_ratio = ratio
+        return best_ratio
+
+    def dynamic_preprocess(self, image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+        orig_width, orig_height = image.size
+        aspect_ratio = orig_width / orig_height
+
+        # calculate the existing image aspect ratio
+        target_ratios = set(
+            (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+            i * j <= max_num and i * j >= min_num)
+        target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+        # find the closest aspect ratio to the target
+        target_aspect_ratio = self.find_closest_aspect_ratio(
+            aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+        # calculate the target width and height
+        target_width = image_size * target_aspect_ratio[0]
+        target_height = image_size * target_aspect_ratio[1]
+        blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+        # resize the image
+        resized_img = image.resize((target_width, target_height))
+        processed_images = []
+        for i in range(blocks):
+            box = (
+                (i % (target_width // image_size)) * image_size,
+                (i // (target_width // image_size)) * image_size,
+                ((i % (target_width // image_size)) + 1) * image_size,
+                ((i // (target_width // image_size)) + 1) * image_size
+            )
+            # split the image
+            split_img = resized_img.crop(box)
+            processed_images.append(split_img)
+        assert len(processed_images) == blocks
+        if use_thumbnail and len(processed_images) != 1:
+            thumbnail_img = image.resize((image_size, image_size))
+            processed_images.append(thumbnail_img)
+        return processed_images
+    
+    def load_video_frames(self, video_frames, input_size=448, max_num=1):
+        pixel_values_list, num_patches_list = [], []
+        transform = self.build_transform(input_size=input_size)
+        for img in video_frames:
+            img = self.dynamic_preprocess(img, image_size=input_size, use_thumbnail=True, max_num=max_num)
+            pixel_values = [transform(tile) for tile in img]
+            pixel_values = torch.stack(pixel_values)
+            num_patches_list.append(pixel_values.shape[0])
+            pixel_values_list.append(pixel_values)
+        pixel_values = torch.cat(pixel_values_list)
+        return pixel_values, num_patches_list
+
+    def map_to_nearest_scale(self, values, scale):
+        tree = cKDTree(np.asarray(scale)[:, None])
+        _, indices = tree.query(np.asarray(values)[:, None])
+        return np.asarray(scale)[indices]
+
+    def group_array(self, arr, size):
+        return [arr[i:i+size] for i in range(0, len(arr), size)]
+
+    def encode_video(self, video_frames, input_fps, choose_fps=3, force_packing=None):
+        MAX_NUM_FRAMES=180 # Indicates the maximum number of frames received after the videos are packed. The actual maximum number of valid frames is MAX_NUM_FRAMES * MAX_NUM_PACKING.
+        MAX_NUM_PACKING=3  # indicates the maximum packing number of video frames. valid range: 1-6
+        TIME_SCALE = 0.1
+
+        frames = video_frames
+        video_duration = len(frames) / input_fps
+        if choose_fps * int(video_duration) <= MAX_NUM_FRAMES:
+            packing_nums = 1      
+        else:
+            packing_nums = math.ceil(video_duration * choose_fps / MAX_NUM_FRAMES)
+            if packing_nums > MAX_NUM_PACKING:
+                packing_nums = MAX_NUM_PACKING
+        frame_idx = [i for i in range(0, len(frames))]      
+        frame_idx =  np.array(frame_idx)
+        if force_packing:
+            packing_nums = min(force_packing, MAX_NUM_PACKING)
+        # print(f'get video frames={len(frame_idx)}, duration={video_duration}, packing_nums={packing_nums}')
+        
+        frame_idx_ts = frame_idx / input_fps
+        scale = np.arange(0, video_duration, TIME_SCALE)
+
+        frame_ts_id = self.map_to_nearest_scale(frame_idx_ts, scale) / TIME_SCALE
+        frame_ts_id = frame_ts_id.astype(np.int32)
+        assert len(frames) == len(frame_ts_id)
+        frame_ts_id_group = self.group_array(frame_ts_id, packing_nums)
+        
+        return frames, frame_ts_id_group
+    
+    def run_inference_on_frames(self, queue, input_fps, curr_frame_number):
         """
         Args:
             queue (deque): Accumulated PIL Frames.
-            system_prompt (str): System Prompt.
-            user_prompt (str): User Prompt.
-            model_name (str): Used Model Name.
-            curr_frame_number (int): Current Frame Number.
+            input_fps (int): Input video FPS.
 
         Returns:
             inference_text (str): Generated Text.
         """
-        # print(f"Processing Frame {curr_frame_number - frame_accumulation + 1} ~ Frame {curr_frame_number}")
-        # print(f"Used Model Name: {model_name}")
-        # print(f"System Prompt: {system_prompt}")
-        # print(f"User Prompt: {user_prompt}")
+        # print(f"Processing Frame {curr_frame_number - self.frame_accumulation + 1} ~ Frame {curr_frame_number}")
+        # print(f"Used Model Name: {self.model_name}")
+        # print(f"System Prompt: {self.system_prompt}")
+        # print(f"User Prompt: {self.user_prompt}")
 
-        inputs = self.processor(
-            text=[self.conversation], 
-            images=None, 
-            videos=[list(queue)], 
-            padding=True, 
-            return_tensors="pt", 
-        ).to(self.model.device, self.model.dtype)
+        if "InternVL3_5" in self.params['model_name']:
+            pixel_values, num_patches_list = self.load_video_frames(list(queue), max_num=1)
+            pixel_values = pixel_values.to(self.model.dtype).to(self.model.device)
+            generation_config = dict(max_new_tokens=256, do_sample=False, pad_token_id=self.tokenizer.eos_token_id, eos_token_id=self.tokenizer.eos_token_id)
+            with torch.no_grad():
+                response, history = self.model.chat(
+                    self.tokenizer, 
+                    pixel_values, 
+                    self.conversation, 
+                    generation_config, 
+                    num_patches_list=num_patches_list, 
+                    history=None, 
+                    return_history=True, 
+                )
+            inference_text = response
+            # print(f"The Results of Frame {curr_frame_number-1} and Frame {curr_frame_number}: {response}")
+        elif "MiniCPM-V-4_5" in self.params['model_name']:
+            force_packing = None # You can set force_packing to ensure that 3D packing is forcibly enabled; otherwise, encode_video will dynamically set the packing quantity based on the duration.
+            frames, frame_ts_id_group = self.encode_video(
+                list(queue), 
+                input_fps, 
+                choose_fps=input_fps, 
+                force_packing=force_packing)
+            msgs = [
+                {"role":"user", "content":frames + [self.params['user_prompt']]}, 
+            ]
+            generation_config = dict(max_new_tokens=256, do_sample=False, pad_token_id=self.tokenizer.eos_token_id, eos_token_id=self.tokenizer.eos_token_id)
+            answer = self.model.chat(
+                msgs=msgs, 
+                system_prompt=self.params['system_prompt'], 
+                tokenizer=self.tokenizer, 
+                use_image_id=False, 
+                max_slice_nums=1, 
+                temporal_ids=frame_ts_id_group, 
+                generation_config=generation_config, 
+            )
+            inference_text = answer
+            # print(f"The Results of Frame {curr_frame_number-1} and Frame {curr_frame_number}: {answer}")
+        else:
+            inputs = self.processor(
+                text=[self.conversation], 
+                images=None, 
+                videos=[list(queue)], 
+                padding=True, 
+                return_tensors="pt", 
+            ).to(self.model.device, self.model.dtype)
 
-        with torch.no_grad():
-            output_ids = self.model.generate(**inputs, max_new_tokens=256, eos_token_id=self.processor.tokenizer.eos_token_id, do_sample=False)
-            generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)]
-            output_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
-        inference_text = output_text[0]
-
-        # print(f"The Results of Frame {curr_frame_number-1} and Frame {curr_frame_number}: {output_text[0]}")
+            with torch.no_grad():
+                output_ids = self.model.generate(**inputs, max_new_tokens=256, eos_token_id=self.processor.tokenizer.eos_token_id, pad_token_id=self.processor.tokenizer.eos_token_id, do_sample=False)
+                generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)]
+                output_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            inference_text = output_text[0]
+            # print(f"The Results of Frame {curr_frame_number-1} and Frame {curr_frame_number}: {output_text[0]}")
         return inference_text
 
+    def stop(self):
+        self.is_running = False
+    
     def run(self):
         cap = None
         out = None
@@ -307,6 +489,7 @@ class InferenceWorker(QThread):
                 self.error_signal.emit("The video file can't be opened.")
                 return
 
+            input_fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             end_frame = min(end_frame, total_frames - 1)
             total_inference_frames = end_frame - start_frame + 1
@@ -333,9 +516,7 @@ class InferenceWorker(QThread):
                     queue.append(frame)
 
                     if len(queue) >= frame_accumulation:
-                        inference_text = self.run_inference_on_frames(
-                            queue, system_prompt, user_prompt, model_name, current_frame_index, frame_accumulation
-                        )
+                        inference_text = self.run_inference_on_frames(queue, input_fps, current_frame_index)
 
                         for index in range(-sliding_window_size, 0):
                             image = self.frame_process(queue[index], inference_text)
@@ -382,7 +563,8 @@ class InferenceWorker(QThread):
             if cap: cap.release()
             if out: out.close()
             del self.model
-            del self.processor
+            if self.processor: del self.processor
+            if self.tokenizer: del self.tokenizer
 
 
 class VideoProcessingWorker(QThread):
@@ -507,6 +689,7 @@ class MainWindow(QMainWindow):
         self.video_worker = None
         self.model = None
         self.processor = None
+        self.tokenizer = None
         self.current_model_name = None
         self.inference_data = []
 
@@ -643,7 +826,7 @@ class MainWindow(QMainWindow):
         self.sliding_window_spinbox.setRange(1, 100)
         self.sliding_window_spinbox.setValue(2)
         self.model_combo = QComboBox()
-        self.model_combo.addItems(["Qwen/Qwen2.5-VL-3B-Instruct", "Qwen/Qwen2.5-VL-7B-Instruct", "llava-hf/llava-onevision-qwen2-0.5b-ov-hf", "llava-hf/llava-onevision-qwen2-7b-ov-hf", "HuggingFaceTB/SmolVLM2-256M-Video-Instruct", "HuggingFaceTB/SmolVLM2-500M-Video-Instruct", "HuggingFaceTB/SmolVLM2-2.2B-Instruct"])
+        self.model_combo.addItems(list(MODEL_MAP.keys()))
         params_form_layout.addRow("Inference start frame:", start_frame_layout)
         params_form_layout.addRow("Inference end frame:", end_frame_layout)
         params_form_layout.addRow("FPS of the generated video:", self.fps_spinbox)
@@ -657,11 +840,13 @@ class MainWindow(QMainWindow):
         prompt_layout = QVBoxLayout()
         self.system_prompt_edit = QTextEdit()
         self.system_prompt_edit.setPlaceholderText("Please input system prompt...")
-        self.system_prompt_edit.setText("You are a helpful assistant.")
+        # self.system_prompt_edit.setText("You are a helpful assistant.")
+        self.system_prompt_edit.setText("You are a precise visual reasoning assistant. If there are multiple people in the video, only focus on the person in the red box.\n\nIf known, the rightmost person (in the red box) is wearing blue clothing. Use this visual cue to identify the correct individual. Ignore all other people, regardless of their actions.\n\nYour task is to identify which tool the rightmost (blue-clothed) person is using. Choose answers strictly from the provided options. If uncertain or if the frame is ambiguous or no matching option, please return Unknown instead of always returning Small Manual Wrench or guessing.\n\nDo not explain or add any extra output. Keep your response concise and in the expected format.")
         self.system_prompt_edit.setMaximumHeight(120)
         self.user_prompt_edit = QTextEdit()
         self.user_prompt_edit.setPlaceholderText("Please input user prompt...")
-        self.user_prompt_edit.setText("Describe the video.")
+        # self.user_prompt_edit.setText("Describe the video.")
+        self.user_prompt_edit.setText("Analyze the given video frame. Focus only on the person on the right side of the frame (in the red box) if more than one person is present.\n\nTool being used by the blue-clothed person in the red box (if any): [Drill, Marker Pen, Brush or Cotton Swab for Oiling, Scanner, Small Manual Wrench, Unknown]\n\nOutput format:\nTool: <your answer>")
         self.user_prompt_edit.setMaximumHeight(120)
         prompt_layout.addWidget(QLabel("System Prompt:"))
         prompt_layout.addWidget(self.system_prompt_edit)
@@ -1079,7 +1264,8 @@ class MainWindow(QMainWindow):
                 if self.model is not None:
                     print(f"Releasing old model: {self.current_model_name}")
                     del self.model
-                    del self.processor
+                    if self.processor: del self.processor
+                    if self.tokenizer: del self.tokenizer
                     torch.cuda.empty_cache()
                     torch.cuda.ipc_collect()
                     gc.collect()
@@ -1102,13 +1288,27 @@ class MainWindow(QMainWindow):
                             torch_dtype=torch.bfloat16,
                             trust_remote_code=True, 
                         )
+                elif "InternVL3_5" in desired_model_name or "MiniCPM-V-4_5" in desired_model_name:
+                    pass
                 else:
                     self.processor = AutoProcessor.from_pretrained(
                         desired_model_name, 
                         torch_dtype=torch.bfloat16,
                         trust_remote_code=True, 
                     )
-                self.processor.tokenizer.padding_side  = "left"
+                if self.processor: self.processor.tokenizer.padding_side = "left"
+                if "InternVL3_5" in desired_model_name:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        desired_model_name, 
+                        trust_remote_code=True, 
+                        use_fast=False, 
+                    )
+                elif "MiniCPM-V-4_5" in desired_model_name:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        desired_model_name, 
+                        trust_remote_code=True, 
+                    )
+                if self.tokenizer: self.tokenizer.padding_side = "left"
                 
                 print(f"Loading new model: {desired_model_name}")
                 self.model = MODEL_MAP[desired_model_name].from_pretrained(
@@ -1116,6 +1316,7 @@ class MainWindow(QMainWindow):
                     torch_dtype=torch.bfloat16, 
                     attn_implementation="flash_attention_2", 
                     device_map="cuda:0", 
+                    trust_remote_code=True, 
                 ).eval()
 
                 self.current_model_name = desired_model_name
@@ -1125,6 +1326,7 @@ class MainWindow(QMainWindow):
                 self.set_ui_enabled(True)
                 self.model = None
                 self.processor = None
+                self.tokenizer = None
                 self.current_model_name = None
                 return
             finally:
@@ -1146,7 +1348,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
 
-        self.inference_worker = InferenceWorker(params, self.model, self.processor)
+        self.inference_worker = InferenceWorker(params, self.model, self.processor, self.tokenizer)
         self.inference_worker.progress_signal.connect(self.update_progress)
         self.inference_worker.finished_signal.connect(self.inference_finished)
         self.inference_worker.error_signal.connect(self.inference_error)
@@ -1302,7 +1504,8 @@ class MainWindow(QMainWindow):
         if self.model is not None:
             print(f"Releasing model {self.current_model_name} on exit.")
             del self.model
-            del self.processor
+            if self.processor: del self.processor
+            if self.tokenizer: del self.tokenizer
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             gc.collect()
