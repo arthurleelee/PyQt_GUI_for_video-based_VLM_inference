@@ -563,8 +563,11 @@ class InferenceWorker(QThread):
             if cap: cap.release()
             if out: out.close()
             del self.model
+            self.model = None
             if self.processor: del self.processor
+            self.processor = None
             if self.tokenizer: del self.tokenizer
+            self.tokenizer = None
 
 
 class VideoProcessingWorker(QThread):
@@ -728,7 +731,7 @@ class MainWindow(QMainWindow):
         self.crop_h_spin = QSpinBox()
         self.crop_x_spin = QSpinBox()
         self.crop_y_spin = QSpinBox()
-        self.apply_crop_btn = QPushButton("Apply Crop")
+        self.apply_crop_btn = QPushButton("Apply Cropping")
         self.apply_crop_btn.clicked.connect(self.apply_crop)
         crop_layout.addRow("Width:", self.crop_w_spin)
         crop_layout.addRow("Height:", self.crop_h_spin)
@@ -742,7 +745,7 @@ class MainWindow(QMainWindow):
         self.resize_w_spin.setRange(1, 3840)
         self.resize_h_spin = QSpinBox()
         self.resize_h_spin.setRange(1, 2160)
-        self.apply_resize_btn = QPushButton("Apply Resize")
+        self.apply_resize_btn = QPushButton("Apply Resizing")
         self.apply_resize_btn.clicked.connect(self.apply_resize)
         resize_layout.addRow("New Width:", self.resize_w_spin)
         resize_layout.addRow("New Height:", self.resize_h_spin)
@@ -1262,14 +1265,18 @@ class MainWindow(QMainWindow):
                 if self.model is not None:
                     print(f"Releasing old model: {self.current_model_name}")
                     del self.model
+                    self.model = None
                     if self.processor: del self.processor
+                    self.processor = None
                     if self.tokenizer: del self.tokenizer
+                    self.tokenizer = None
                     torch.cuda.empty_cache()
                     torch.cuda.ipc_collect()
                     gc.collect()
                 
                 print(f"Loading Processor...")
                 if "Qwen2.5-VL" in desired_model_name:
+                    # Temporarily fix this setting
                     MIN_PIXELS = 224 * 28 * 28
                     MAX_PIXELS = 840 * 28 * 28
                     if MIN_PIXELS is not None and MAX_PIXELS is not None:
@@ -1369,6 +1376,7 @@ class MainWindow(QMainWindow):
         if self.processed_cap.isOpened():
             self.video_source_combo.model().item(2).setEnabled(True)
             self.video_source_combo.setCurrentIndex(2)
+            self.switch_video_source("Inferred Video")
 
     def inference_error(self, error_message):
         self.progress_bar.setVisible(False)
@@ -1415,8 +1423,7 @@ class MainWindow(QMainWindow):
         self.display_frame(frame_to_jump)
 
     def display_frame(self, frame_number, frame=None):
-        if self.is_playing is False:
-            self.playback_slider.setValue(frame_number)
+        self.playback_slider.setValue(frame_number)
 
         if frame is None:
             cap = self.get_current_cap()
@@ -1502,8 +1509,11 @@ class MainWindow(QMainWindow):
         if self.model is not None:
             print(f"Releasing model {self.current_model_name} on exit.")
             del self.model
+            self.model  = None
             if self.processor: del self.processor
+            self.processor  = None
             if self.tokenizer: del self.tokenizer
+            self.tokenizer  = None
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             gc.collect()
