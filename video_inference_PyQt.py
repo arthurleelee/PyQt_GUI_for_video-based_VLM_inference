@@ -6,41 +6,47 @@ import torch
 import numpy as np
 import imageio
 import gc
-from ffmpeg_progress_yield import FfmpegProgress
+import subprocess
 import shutil
 import math
 import torchvision.transforms as T
+import supervision as sv
+import multiprocessing as mp
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QFileDialog, QSlider, QSpinBox, QComboBox, QTextEdit, QGroupBox,
-    QFormLayout, QMessageBox, QProgressBar, QStyle, QSizePolicy, QTabWidget, QColorDialog, QScrollArea
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
+    QLabel, QFileDialog, QSlider, QSpinBox, QComboBox, QTextEdit, 
+    QGroupBox, QFormLayout, QMessageBox, QProgressBar, QStyle, QSizePolicy, 
+    QTabWidget, QColorDialog, QScrollArea, QLineEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt6.QtGui import QImage, QPixmap, QColor
 from collections import deque
-from transformers import Qwen2_5_VLForConditionalGeneration, LlavaOnevisionForConditionalGeneration, AutoModelForImageTextToText, AutoTokenizer, AutoProcessor, AutoModel
+from transformers import Qwen2_5_VLForConditionalGeneration, LlavaOnevisionForConditionalGeneration, AutoModelForImageTextToText, AutoTokenizer, AutoProcessor, AutoModel, AutoModelForZeroShotObjectDetection
 from qwen_vl_utils import process_vision_info
 from PIL import ImageFont, Image, ImageDraw
 from torchvision.transforms.functional import InterpolationMode
 from scipy.spatial import cKDTree
+from ffmpeg_progress_yield import FfmpegProgress
+from sam2.build_sam import build_sam2_video_predictor, build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 
 STYLE_SHEET = """
-/* 全域設定 */
+/* Global Settings */
 QWidget {
     font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
     font-size: 16px;
-    color: #f0f0f0; /* 亮灰色文字 */
-    background-color: #1a1a1a; /* 極暗背景 */
+    color: #f0f0f0; /* Light Gray Text */
+    background-color: #1a1a1a; /* Dark Background */
 }
 
-/* 主視窗 */
+/* Main Window */
 QMainWindow {
     background-color: #121212;
 }
 
-/* 群組框 */
+/* GroupBox */
 QGroupBox {
     background-color: #242424;
     border: 1px solid #333333;
@@ -53,10 +59,10 @@ QGroupBox::title {
     subcontrol-position: top center;
     padding: 0 10px;
     background-color: #242424;
-    color: #39ff14; /* 霓虹綠強調色 */
+    color: #39ff14; /* Neon Green Accent Color */
 }
 
-/* 按鈕 */
+/* Button */
 QPushButton {
     background-color: #333333;
     border: 1px solid #444444;
@@ -71,14 +77,14 @@ QPushButton:hover {
 }
 QPushButton:pressed {
     background-color: #39ff14;
-    color: #1a1a1a; /* 按下時反色 */
+    color: #1a1a1a; /* Invert Color When Pressed */
 }
 QPushButton:disabled {
     background-color: #2a2a2a;
     color: #555555;
 }
 
-/* 文字輸入、SpinBox、下拉選單 */
+/* TextEdit, SpinBox, ComboBox */
 QTextEdit, QSpinBox, QComboBox {
     background-color: #1a1a1a;
     border: 1px solid #444444;
@@ -106,7 +112,7 @@ QSpinBox::down-button {
     subcontrol-position: bottom right;
 }
 
-/* 滑桿 */
+/* Slider */
 QSlider::groove:horizontal {
     border: 1px solid #333333;
     background: #1a1a1a;
@@ -116,13 +122,13 @@ QSlider::groove:horizontal {
 QSlider::handle:horizontal {
     background: #39ff14;
     border: 2px solid #39ff14;
-    width: 14px; /* 稍微調整大小 */
+    width: 14px;
     height: 14px;
     margin: -7px 0;
     border-radius: 8px;
 }
 
-/* 進度條 */
+/* ProgressBar */
 QProgressBar {
     background: #f0f0f0;
     border: 1px solid #444444;
@@ -136,7 +142,7 @@ QProgressBar::chunk {
     border-radius: 4px;
 }
 
-/* 影片顯示標籤 */
+/* VideoDisplayLabel */
 VideoDisplayLabel {
     background-color: black;
     border: 2px solid #242424;
@@ -161,25 +167,22 @@ MODEL_MAP = {
 }
 
 
-class InferenceWorker(QThread):
-    progress_signal = pyqtSignal(int)
-    finished_signal = pyqtSignal(str, list) # (output_video_path, generated_texts)
-    error_signal = pyqtSignal(str)
-
-    def __init__(self, params, model, processor=None, tokenizer=None):
+class VLM_Inference():
+    def __init__(self, params, progress_queue, finished_queue, error_queue):
         super().__init__()
         self.params = params
-        self.is_running = True
-        self.model = model
-        self.processor = processor
-        self.tokenizer = tokenizer
+        self.progress_queue = progress_queue
+        self.finished_queue = finished_queue
+        self.error_queue = error_queue
+        self.model = None
+        self.processor = None
+        self.tokenizer = None
         self.conversation = None
 
         print("--- Loading Conversation Template. ---")
         if "InternVL3_5" in self.params["model_name"]:
             video_prefix = "".join([f"Frame{i+1}: <image>\n" for i in range(self.params["frame_accumulation"])])
             self.conversation = video_prefix + self.params["user_prompt"]
-            self.model.system_message = self.params["system_prompt"]
         elif "MiniCPM-V-4_5" in self.params["model_name"]:
             pass
         else:
@@ -233,9 +236,7 @@ class InferenceWorker(QThread):
                     }
                 ]
 
-            self.conversation = self.processor.apply_chat_template(
-                conversation, tokenize=False, add_generation_prompt=True
-            )
+            self.conversation = conversation
         print("--- Complete Conversation Template. ---")
 
     def wrap_text_pixelwise(self, text, font, max_width):
@@ -275,12 +276,6 @@ class InferenceWorker(QThread):
             draw.text((text_x, text_y), line, font=font, fill=(255, 255, 255), spacing=line_spacing)
             text_y += line_height + line_spacing
         cv2_image = cv2.cvtColor(np.asarray(new_img), cv2.COLOR_RGB2BGR)
-        # OpenCV
-        # cv2_image = cv2.cvtColor(np.asarray(PIL_image), cv2.COLOR_RGB2BGR)
-        # text_size, baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)
-        # text_w, text_h = text_size
-        # cv2.rectangle(cv2_image, (10, 30 - text_h - 5), (10 + text_w, 30 + baseline), (34, 139, 34, 0.5), -1)
-        # cv2.putText(cv2_image, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
         return cv2_image
 
     def build_transform(self, input_size):
@@ -465,13 +460,10 @@ class InferenceWorker(QThread):
             inference_text = output_text[0]
             # print(f"The Results of Frame {curr_frame_number-1} and Frame {curr_frame_number}: {output_text[0]}")
         return inference_text
-
-    def stop(self):
-        self.is_running = False
     
     def run(self):
-        cap = None
-        out = None
+        self.cap = None
+        self.out = None
         try:
             video_path = self.params["video_path"]
             start_frame = self.params["start_frame"]
@@ -483,13 +475,85 @@ class InferenceWorker(QThread):
             user_prompt = self.params["user_prompt"]
             model_name = self.params["model_name"]
 
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                self.error_signal.emit("The video file can't be opened.")
+            try:
+                print(f"Loading Processor...")
+                if "Qwen2.5-VL" in model_name:
+                    # Temporarily fix this setting
+                    MIN_PIXELS = 224 * 28 * 28
+                    MAX_PIXELS = 840 * 28 * 28
+                    if MIN_PIXELS is not None and MAX_PIXELS is not None:
+                        self.processor = AutoProcessor.from_pretrained(
+                            model_name, 
+                            torch_dtype=torch.bfloat16,
+                            trust_remote_code=True, 
+                            min_pixels=MIN_PIXELS, 
+                            max_pixels=MAX_PIXELS, 
+                        )
+                    else:
+                        self.processor = AutoProcessor.from_pretrained(
+                            model_name, 
+                            torch_dtype=torch.bfloat16,
+                            trust_remote_code=True, 
+                        )
+                elif "InternVL3_5" in model_name or "MiniCPM-V-4_5" in model_name:
+                    pass
+                else:
+                    self.processor = AutoProcessor.from_pretrained(
+                        model_name, 
+                        torch_dtype=torch.bfloat16,
+                        trust_remote_code=True, 
+                    )
+                if self.processor: self.processor.tokenizer.padding_side = "left"
+                if "InternVL3_5" in model_name:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        model_name, 
+                        trust_remote_code=True, 
+                        use_fast=False, 
+                    )
+                elif "MiniCPM-V-4_5" in model_name:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        model_name, 
+                        trust_remote_code=True, 
+                    )
+                if self.tokenizer: self.tokenizer.padding_side = "left"
+                
+                print(f"Loading the model: {model_name}")
+                self.model = MODEL_MAP[model_name].from_pretrained(
+                    model_name, 
+                    torch_dtype=torch.bfloat16, 
+                    attn_implementation="flash_attention_2", 
+                    device_map="cuda:0", 
+                    trust_remote_code=True, 
+                ).eval()
+                print(f"Successfully loaded {model_name}.")
+            except Exception as e:
+                self.error_queue.put(e)
+                if self.cap: self.cap.release()
+                if self.out: self.out.close()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                gc.collect()
+                return
+            
+            if "InternVL3_5" not in model_name and "MiniCPM-V-4_5" not in model_name:
+                self.conversation = self.processor.apply_chat_template(
+                    self.conversation, tokenize=False, add_generation_prompt=True
+                )
+            if "InternVL3_5" in model_name:
+                self.model.system_message = self.params["system_prompt"]
+
+            self.cap = cv2.VideoCapture(video_path)
+            if not self.cap.isOpened():
+                self.error_queue.put("The video file can't be opened.")
+                if self.cap: self.cap.release()
+                if self.out: self.out.close()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                gc.collect()
                 return
 
-            input_fps = int(cap.get(cv2.CAP_PROP_FPS))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            input_fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+            total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             end_frame = min(end_frame, total_frames - 1)
             total_inference_frames = end_frame - start_frame + 1
             
@@ -499,15 +563,15 @@ class InferenceWorker(QThread):
             output_filename = f"result_{os.path.splitext(os.path.basename(video_path))[0]}_{timestamp}.mp4"
             output_video_path = os.path.join(output_dir, output_filename)            
 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
             current_frame_index = start_frame
             queue = deque()
             generated_texts = []
             
             # The QThread signal may be executed first and then "finally", so you must use "with" to close the writer.
-            with imageio.get_writer(output_video_path, fps=output_fps) as out:
-                while self.is_running and current_frame_index <= end_frame:
-                    ret, frame = cap.read()
+            with imageio.get_writer(output_video_path, fps=output_fps) as self.out:
+                while current_frame_index <= end_frame:
+                    ret, frame = self.cap.read()
                     if not ret:
                         break
 
@@ -520,7 +584,7 @@ class InferenceWorker(QThread):
                         for index in range(-sliding_window_size, 0):
                             image = self.frame_process(queue[index], inference_text)
                             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                            out.append_data(image)
+                            self.out.append_data(image)
 
                             generated_texts.append({
                                 "current_frame": current_frame_index + index + 1,
@@ -532,7 +596,7 @@ class InferenceWorker(QThread):
                     elif len(queue) <= frame_accumulation - sliding_window_size:
                         image = self.frame_process(frame, "None")
                         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                        out.append_data(image)
+                        self.out.append_data(image)
 
                         generated_texts.append({
                             "current_frame": current_frame_index,
@@ -541,33 +605,282 @@ class InferenceWorker(QThread):
 
                     current_frame_index += 1
                     progress = int((current_frame_index - start_frame) / total_inference_frames * 100)
-                    self.progress_signal.emit(progress)
+                    self.progress_queue.put(progress)
 
                 if len(queue) > frame_accumulation - sliding_window_size:
                     for index in range(-(len(queue) - frame_accumulation + sliding_window_size), 0):
                         image = self.frame_process(queue[index], "None")
                         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                        out.append_data(image)
+                        self.out.append_data(image)
 
                         generated_texts.append({
                             "current_frame": current_frame_index - 1 + index + 1,
                             "text": "None"
                         })
             
-            if self.is_running:
-                self.finished_signal.emit(output_video_path, generated_texts)
+            self.finished_queue.put((output_video_path, generated_texts))
+        except Exception as e:
+            self.error_queue.put(e)
+        finally:
+            if self.cap: self.cap.release()
+            if self.out: self.out.close()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            gc.collect()
+
+
+def run_VLM_in_process(params, progress_queue, finished_queue, error_queue):
+    try:
+        VLM_process = VLM_Inference(params, progress_queue, finished_queue, error_queue)
+        VLM_process.run()
+    except Exception as e:
+        if error_queue.empty():
+            error_queue.put(e)
+
+
+class InferenceWorker(QThread):
+    progress_signal = pyqtSignal(int)
+    finished_signal = pyqtSignal(str, list) # (output_video_path, generated_texts)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, params):
+        super().__init__()
+        self.params = params
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+    
+    def poll_progress(self):
+        while not self.progress_queue.empty():
+            value = self.progress_queue.get()
+            self.progress_signal.emit(value)
+
+        if not self.process.is_alive():
+            if not self.error_queue.empty():
+                e = self.error_queue.get()
+                print(e)
+                self.error_signal.emit(f"An error occurred during processing: {e}")
+            else:
+                self.progress_signal.emit(100)
+                if self.is_running:
+                    output_video_path, generated_texts = self.finished_queue.get()
+                    self.finished_signal.emit(output_video_path, generated_texts)
+            self.quit()
+
+    def run(self):
+        try:
+            self.progress_queue = mp.Queue()
+            self.finished_queue = mp.Queue()
+            self.error_queue = mp.Queue()
+
+            self.process = mp.Process(target=run_VLM_in_process, args=(self.params, self.progress_queue, self.finished_queue, self.error_queue))
+            self.process.start()
+
+            self.timer = QTimer()
+            self.timer.timeout.connect(self.poll_progress)
+            self.timer.start(100)
+
+            self.exec()
+            
         except Exception as e:
             print(e)
             self.error_signal.emit(f"An error occurred during processing: {e}")
-        finally:
+
+
+def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
+    try:
+        # `input_path` a path of video 
+        input_path = params["input_path"]
+        output_path = params["output_path"]
+        fps = params["fps"]
+        generate_box = params.get("generate_box", True)
+        generate_label = params.get("generate_label", False)
+        generate_mask = params.get("generate_mask", False)
+        # setup the input image and text prompt for SAM 2 and Grounding DINO
+        # VERY important: text queries need to be lowercased + end with a dot
+        text = params["text"]
+        box_color = params["box_color"]
+        box_thickness = params["box_thickness"]
+
+        out = None
+
+        """
+        Step 1: Environment settings and model initialization
+        """
+        sam2_checkpoint = "sam2.1_hiera_large.pt"
+        sam2p1_cfg_map = {
+            "sam2.1_hiera_tiny.pt": "configs/sam2.1/sam2.1_hiera_t.yaml",
+            "sam2.1_hiera_small.pt": "configs/sam2.1/sam2.1_hiera_s.yaml",
+            "sam2.1_hiera_base_plus.pt": "configs/sam2.1/sam2.1_hiera_b+.yaml",
+            "sam2.1_hiera_large.pt": "configs/sam2.1/sam2.1_hiera_l.yaml",
+        }
+        model_cfg = sam2p1_cfg_map[sam2_checkpoint]
+        if not os.path.exists(sam2_checkpoint):
+            # SAM 2.1 checkpoints
+            SAM2p1_BASE_URL = "https://dl.fbaipublicfiles.com/segment_anything_2/092824"
+            sam2p1_hiera_t_url = f"{SAM2p1_BASE_URL}/sam2.1_hiera_tiny.pt"
+            sam2p1_hiera_s_url = f"{SAM2p1_BASE_URL}/sam2.1_hiera_small.pt"
+            sam2p1_hiera_b_plus_url = f"{SAM2p1_BASE_URL}/sam2.1_hiera_base_plus.pt"
+            sam2p1_hiera_l_url = f"{SAM2p1_BASE_URL}/sam2.1_hiera_large.pt"
+            print(f"Downloading {sam2_checkpoint} checkpoint...")
+            try:
+                command = f"wget {sam2p1_hiera_l_url} -O {sam2_checkpoint}"
+                subprocess.run(command, check=True, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except subprocess.CalledProcessError as e:
+                error_queue.put(f"An error occurred: {e.stderr.decode()}\n" + f"Failed to download {sam2_checkpoint} checkpoint.")
+                return
+
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+
+        video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
+        # init video predictor state
+        inference_state = video_predictor.init_state(video_path=input_path)
+        sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
+        image_predictor = SAM2ImagePredictor(sam2_image_model)
+
+        # init grounding dino model from huggingface
+        model_id = "IDEA-Research/grounding-dino-base"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        processor = AutoProcessor.from_pretrained(model_id)
+        grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
+
+        # read all the frame names from video
+        images = []
+        cap = cv2.VideoCapture(input_path)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            images.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+
+        ann_frame_idx = 0  # the frame index we interact with
+        ann_obj_id = 1  # give a unique id to each object we interact with (it can be any integers)
+
+        progress_queue.put(20)
+
+        """
+        Step 2: Prompt Grounding DINO and SAM image predictor to get the box and mask for specific frame
+        """
+        # prompt grounding dino to get the box coordinates on specific frame
+        image = images[ann_frame_idx]
+
+        # run Grounding DINO on the image
+        inputs = processor(images=image, text=text, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = grounding_model(**inputs)
+
+        results = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            box_threshold=0.25,
+            text_threshold=0.3,
+            target_sizes=[image.size[::-1]]
+        )
+
+        # Apply NMS
+        boxes_raw = results[0]["boxes"]
+        scores_raw = results[0]["scores"]
+        labels_raw = results[0]["labels"]
+
+        if boxes_raw.shape[0] == 0:
+            error_queue.put("Grounding DINO did not detect any objects!")
             if cap: cap.release()
             if out: out.close()
-            del self.model
-            self.model = None
-            if self.processor: del self.processor
-            self.processor = None
-            if self.tokenizer: del self.tokenizer
-            self.tokenizer = None
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            gc.collect()
+            return
+        
+        class_names = [name.strip() for name in text.split('.') if name.strip()]
+        class_to_id = {name: i for i, name in enumerate(class_names)}
+        class_ids_raw = np.array([class_to_id[label] for label in labels_raw])
+
+        detections_gd = sv.Detections(
+            xyxy=boxes_raw.cpu().numpy(), 
+            confidence=scores_raw.cpu().numpy(), 
+            class_id=class_ids_raw, 
+            data={'labels': labels_raw}
+        )
+        NMS_IOU_THRESHOLD = 0.5 
+        detections_filtered = detections_gd.with_nms(threshold=NMS_IOU_THRESHOLD)
+        print(f"Originally detect {len(detections_gd)} bounding boxes. Remain {len(detections_filtered)} bounding boxes after NMS.")
+
+        # prompt SAM image predictor to get the mask for the object
+        image_predictor.set_image(np.array(image.convert("RGB")))
+
+        # process the detection results
+        input_boxes = detections_filtered.xyxy
+        OBJECTS = detections_filtered.data['labels']
+
+        progress_queue.put(40)
+
+        """
+        Step 3: Register each object's positive points to video predictor with seperate add_new_points call
+        """
+        # Using box prompt
+        for object_id, (label, box) in enumerate(zip(OBJECTS, input_boxes), start=1):
+            _, out_obj_ids, out_mask_logits = video_predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=ann_frame_idx,
+                obj_id=object_id,
+                box=box,
+            )
+
+        progress_queue.put(60)
+        
+        """
+        Step 4: Propagate the video predictor to get the segmentation results for each frame
+        """
+        video_segments = {}  # video_segments contains the per-frame segmentation results
+        for idx, (out_frame_idx, out_obj_ids, out_mask_logits) in enumerate(video_predictor.propagate_in_video(inference_state)):
+            video_segments[out_frame_idx] = {
+                out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                for i, out_obj_id in enumerate(out_obj_ids)
+            }
+
+            progress_queue.put(int(60 + (idx + 1) / len(images) * 20))
+        
+        """
+        Step 5: Draw the segment results and save video
+        """
+        ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
+        # The QThread signal may be executed first and then "finally", so you must use "with" to close the writer.
+        with imageio.get_writer(output_path, fps=fps) as out:
+            for progress, (frame_idx, segments) in enumerate(video_segments.items()):
+                img = cv2.cvtColor(np.asarray(images[frame_idx]), cv2.COLOR_RGB2BGR)
+                
+                object_ids = list(segments.keys())
+                masks = list(segments.values())
+                masks = np.concatenate(masks, axis=0)
+                
+                detections = sv.Detections(
+                    xyxy=sv.mask_to_xyxy(masks),  # (n, 4)
+                    mask=masks, # (n, h, w)
+                    class_id=np.array(object_ids, dtype=np.int32),
+                )
+                annotated_frame = img.copy()
+                if generate_box:
+                    box_annotator = sv.BoxAnnotator(color=sv.Color(r=box_color[0], g=box_color[1], b=box_color[2]), thickness=box_thickness)
+                    annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=detections)
+                    if generate_label:
+                        label_annotator = sv.LabelAnnotator()
+                        annotated_frame = label_annotator.annotate(annotated_frame, detections=detections, labels=[ID_TO_OBJECTS[i] for i in object_ids])
+                if generate_mask:
+                    mask_annotator = sv.MaskAnnotator()
+                    annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
+                annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                out.append_data(annotated_frame)
+
+                progress_queue.put(int(80 + (progress + 1) / len(video_segments) * 20))
+
+    except Exception as e:
+        error_queue.put(e)
+    finally:
+        if out: out.close()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        gc.collect()
 
 
 class VideoProcessingWorker(QThread):
@@ -585,10 +898,11 @@ class VideoProcessingWorker(QThread):
         
     def run(self):
         mapping = {
-            "clip": self.run_clip_operation,
-            "crop": self.run_crop_operation,
-            "resize": self.run_resize_operation,
-            "draw": self.run_draw_operation,
+            "Clip": self.run_clip_operation,
+            "Crop": self.run_crop_operation,
+            "Resize": self.run_resize_operation,
+            "Draw": self.run_draw_operation,
+            "Grounded-SAM2-Tracking": self.run_Grounded_SAM2_operation,
         }
         operation = self.params.get("operation", None)
         if operation and operation in mapping:
@@ -716,6 +1030,41 @@ class VideoProcessingWorker(QThread):
         finally:
             if cap: cap.release()
             if out: out.close()
+    
+    def poll_progress(self):
+        while not self.progress_queue.empty():
+            value = self.progress_queue.get()
+            self.progress_signal.emit(value)
+        
+        if not self.process.is_alive():
+            if not self.error_queue.empty():
+                e = self.error_queue.get()
+                print(e)
+                self.error_signal.emit(f"Error during Grounded-SAM2-Tracking operation: {e}")
+            else:
+                self.progress_signal.emit(100)
+                if self.is_running:
+                    self.finished_signal.emit(self.output_path)
+            self.quit()
+    
+    def run_Grounded_SAM2_operation(self):
+        try:
+            self.progress_queue = mp.Queue()
+            self.error_queue = mp.Queue()
+            self.output_path = self.params["output_path"]
+
+            self.process = mp.Process(target=run_Grounded_SAM2_steps, args=(self.params, self.progress_queue, self.error_queue))
+            self.process.start()
+
+            self.timer = QTimer()
+            self.timer.timeout.connect(self.poll_progress)
+            self.timer.start(100)
+
+            self.exec()
+
+        except Exception as e:
+            print(e)
+            self.error_signal.emit(f"Error during Grounded-SAM2-Tracking operation: {e}")
 
 
 class VideoDisplayLabel(QLabel):
@@ -754,7 +1103,8 @@ class MainWindow(QMainWindow):
 
         self.processed_cap = None
 
-        self.drawing_color = QColor(Qt.GlobalColor.red)
+        self.draw_color = QColor(Qt.GlobalColor.red)
+        self.gsam2_box_color = QColor(Qt.GlobalColor.red)
         self.total_frames = 0
         self.video_width = 0
         self.video_height = 0
@@ -765,10 +1115,6 @@ class MainWindow(QMainWindow):
         
         self.inference_worker = None
         self.video_worker = None
-        self.model = None
-        self.processor = None
-        self.tokenizer = None
-        self.current_model_name = None
         self.inference_data = []
 
         self.initUI()
@@ -845,16 +1191,16 @@ class MainWindow(QMainWindow):
         self.draw_x2_width_spin = QSpinBox()
         self.draw_y2_height_spin = QSpinBox()
         self.draw_thickness_spin = QSpinBox()
-        self.draw_thickness_spin.setValue(2)
+        self.draw_thickness_spin.setValue(3)
         
-        color_layout = QHBoxLayout()
-        self.pick_color_btn = QPushButton("Pick Color")
-        self.pick_color_btn.clicked.connect(self.pick_draw_color)
-        self.color_preview_label = QLabel()
-        self.color_preview_label.setFixedSize(50, 20)
-        self.update_color_preview()
-        color_layout.addWidget(self.pick_color_btn)
-        color_layout.addWidget(self.color_preview_label)
+        draw_color_layout = QHBoxLayout()
+        self.draw_pick_color_btn = QPushButton("Pick Color")
+        self.draw_pick_color_btn.clicked.connect(self.draw_pick_color)
+        self.draw_color_preview_label = QLabel()
+        self.draw_color_preview_label.setFixedSize(50, 20)
+        self.draw_update_color_preview()
+        draw_color_layout.addWidget(self.draw_pick_color_btn)
+        draw_color_layout.addWidget(self.draw_color_preview_label)
         
         self.apply_draw_btn = QPushButton("Apply Drawing")
         self.apply_draw_btn.clicked.connect(self.apply_drawing)
@@ -865,13 +1211,45 @@ class MainWindow(QMainWindow):
         draw_layout.addRow("Width/X2:", self.draw_x2_width_spin)
         draw_layout.addRow("Height/Y2:", self.draw_y2_height_spin)
         draw_layout.addRow("Thickness:", self.draw_thickness_spin)
-        draw_layout.addRow(color_layout)
+        draw_layout.addRow(draw_color_layout)
         draw_layout.addRow(self.apply_draw_btn)
+
+        gsam2_widget = QWidget()
+        gsam2_layout = QFormLayout(gsam2_widget)
+        self.gsam_option_combo = QComboBox()
+        self.gsam_option_combo.addItems(["Only Boxes", "Only Masks", "Only Boxes with Labels", "Boxes and Masks", "Boxes and Masks with Labels"])
+        self.gsam2_text_prompt_lineedit = QLineEdit()
+        self.gsam2_text_prompt_lineedit.setPlaceholderText("Keyword (e.g., \"person.\" or \"white car.\")")
+        self.gsam2_fps_spin = QSpinBox()
+        self.gsam_note_label = QLabel("Note:\n1. This is Grounded SAM 2 Video Object Tracking.\n2. The video shouldn't be too long, otherwise it will cause out of memory.\n3. It is important that text prompt must be lowercased + end with a dot.")
+        self.gsam_note_label.setStyleSheet("color: red")
+        self.apply_gsam2_btn = QPushButton("Apply Grounded-SAM2-Tracking")
+        self.apply_gsam2_btn.clicked.connect(self.apply_Grounded_SAM2)
+        self.gsam2_box_thickness_spin = QSpinBox()
+        self.gsam2_box_thickness_spin.setValue(3)
+        
+        gsam2_box_color_layout = QHBoxLayout()
+        self.gsam2_box_pick_color_btn = QPushButton("Pick Boxes Color")
+        self.gsam2_box_pick_color_btn.clicked.connect(self.gsam2_box_pick_color)
+        self.gsam2_box_color_preview_label = QLabel()
+        self.gsam2_box_color_preview_label.setFixedSize(50, 20)
+        self.gsam2_box_update_color_preview()
+        gsam2_box_color_layout.addWidget(self.gsam2_box_pick_color_btn)
+        gsam2_box_color_layout.addWidget(self.gsam2_box_color_preview_label)
+        
+        gsam2_layout.addRow("Generated Type:", self.gsam_option_combo)
+        gsam2_layout.addRow("Text Prompt:", self.gsam2_text_prompt_lineedit)
+        gsam2_layout.addRow("FPS of the edited video:", self.gsam2_fps_spin)
+        gsam2_layout.addRow("Boxes Thickness:", self.gsam2_box_thickness_spin)
+        gsam2_layout.addRow(gsam2_box_color_layout)
+        gsam2_layout.addRow(self.gsam_note_label)
+        gsam2_layout.addRow(self.apply_gsam2_btn)
         
         self.edit_tabs.addTab(clip_widget, "Clip")
         self.edit_tabs.addTab(crop_widget, "Crop")
         self.edit_tabs.addTab(resize_widget, "Resize")
         self.edit_tabs.addTab(draw_widget, "Draw")
+        self.edit_tabs.addTab(gsam2_widget, "Grounded-SAM2")
         
         edit_buttons_layout = QHBoxLayout()
         self.save_edited_btn = QPushButton("Save Edited Video As...")
@@ -1093,6 +1471,7 @@ class MainWindow(QMainWindow):
         self.clip_fps_spin.setRange(1, 240)
         self.resize_w_spin.setRange(1, 3840)
         self.resize_h_spin.setRange(1, 2160)
+        self.gsam2_fps_spin.setRange(1, 240)
 
         self.clip_start_spin.setValue(0)
         self.clip_end_spin.setValue(total_frames - 1)
@@ -1101,6 +1480,7 @@ class MainWindow(QMainWindow):
         self.crop_h_spin.setValue(video_height)
         self.resize_w_spin.setValue(video_width)
         self.resize_h_spin.setValue(video_height)
+        self.gsam2_fps_spin.setValue(current_fps)
     
     def start_and_end_frame_slider_setting(self):
         inference_source = self.inference_source_combo.currentText()
@@ -1180,7 +1560,7 @@ class MainWindow(QMainWindow):
         output_path = os.path.join(self.temp_dir, f"edited_{str(time.time()).replace('.', '_')}.mp4")
         
         params = {
-            "operation": "clip",
+            "operation": "Clip",
             "input_path": source_path,
             "output_path": output_path,
             "start": self.clip_start_spin.value(),
@@ -1200,7 +1580,7 @@ class MainWindow(QMainWindow):
         output_path = os.path.join(self.temp_dir, f"edited_{str(time.time()).replace('.', '_')}.mp4")
         
         params = {
-            "operation": "crop",
+            "operation": "Crop",
             "input_path": source_path,
             "output_path": output_path,
             "width": self.crop_w_spin.value(),
@@ -1220,7 +1600,7 @@ class MainWindow(QMainWindow):
         output_path = os.path.join(self.temp_dir, f"edited_{str(time.time()).replace('.', '_')}.mp4")
         
         params = {
-            "operation": "resize",
+            "operation": "Resize",
             "input_path": source_path,
             "output_path": output_path,
             "width": self.resize_w_spin.value(),
@@ -1228,16 +1608,16 @@ class MainWindow(QMainWindow):
         }
         self.video_processing_start(params, "Applying resizing...")
 
-    def pick_draw_color(self):
+    def draw_pick_color(self):
         color = QColorDialog.getColor()
         if color.isValid():
-            self.drawing_color = color
-            self.update_color_preview()
+            self.draw_color = color
+            self.draw_update_color_preview()
 
-    def update_color_preview(self):
-        pixmap = QPixmap(self.color_preview_label.size())
-        pixmap.fill(self.drawing_color)
-        self.color_preview_label.setPixmap(pixmap)
+    def draw_update_color_preview(self):
+        pixmap = QPixmap(self.draw_color_preview_label.size())
+        pixmap.fill(self.draw_color)
+        self.draw_color_preview_label.setPixmap(pixmap)
 
     def apply_drawing(self):
         source_path = self.get_current_editing_source_path()
@@ -1250,16 +1630,64 @@ class MainWindow(QMainWindow):
         output_path = os.path.join(self.temp_dir, f"edited_{str(time.time()).replace('.', '_')}.mp4")
         
         params = {
-            "operation": "draw",
+            "operation": "Draw",
             "input_path": source_path,
             "output_path": output_path,
             "shape": self.draw_shape_combo.currentText(),
             "coords": (self.draw_x1_spin.value(), self.draw_y1_spin.value(), 
                        self.draw_x2_width_spin.value(), self.draw_y2_height_spin.value()),
-            "color": (self.drawing_color.blue(), self.drawing_color.green(), self.drawing_color.red()), # BGR for OpenCV
+            "color": (self.draw_color.blue(), self.draw_color.green(), self.draw_color.red()), # BGR for OpenCV
             "thickness": self.draw_thickness_spin.value()
         }
         self.video_processing_start(params, "Applying drawing...")
+    
+    def gsam2_box_pick_color(self):
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.gsam2_box_color = color
+            self.gsam2_box_update_color_preview()
+
+    def gsam2_box_update_color_preview(self):
+        pixmap = QPixmap(self.gsam2_box_color_preview_label.size())
+        pixmap.fill(self.gsam2_box_color)
+        self.gsam2_box_color_preview_label.setPixmap(pixmap)
+
+    def apply_Grounded_SAM2(self):
+        source_path = self.get_current_editing_source_path()
+        if not source_path: return
+
+        if self.video_worker and self.video_worker.isRunning():
+            QMessageBox.warning(self, "Busy", "Another video processing task is already running.")
+            return
+
+        output_path = os.path.join(self.temp_dir, f"edited_{str(time.time()).replace('.', '_')}.mp4")
+        
+        if self.gsam2_text_prompt_lineedit.text() == "":
+            QMessageBox.critical(self, "ERROR", "The text prompt can't be empty.")
+            return
+        text = self.gsam2_text_prompt_lineedit.text().strip()
+        if not text.islower() or text.count(".") != len([x for x in text.split(".") if x]):
+            QMessageBox.critical(self, "ERROR", "It is important that text prompt must be lowercased + end with a dot.")
+            return
+        
+        generated_type_map = {
+            "Only Boxes": {"generate_box": True, "generate_label": False,"generate_mask": False}, 
+            "Only Masks": {"generate_box": False, "generate_label": False,"generate_mask": True}, 
+            "Only Boxes with Labels": {"generate_box": True, "generate_label": True,"generate_mask": False}, 
+            "Boxes and Masks": {"generate_box": True, "generate_label": False,"generate_mask": True}, 
+            "Boxes and Masks with Labels": {"generate_box": True, "generate_label": True,"generate_mask": True},
+        }
+        params = {
+            "operation": "Grounded-SAM2-Tracking",
+            "input_path": source_path,
+            "output_path": output_path,
+            "fps": self.gsam2_fps_spin.value(),
+            "text": self.gsam2_text_prompt_lineedit.text(), 
+            "box_color": (self.gsam2_box_color.red(), self.gsam2_box_color.green(), self.gsam2_box_color.blue()), 
+            "box_thickness": self.gsam2_box_thickness_spin.value()
+        }
+        params |= generated_type_map[self.gsam_option_combo.currentText()]
+        self.video_processing_start(params, "Applying Grounded-SAM2-Tracking...")
         
     def video_processing_start(self, params, status_text):
         self.set_ui_enabled(False, status_text)
@@ -1273,13 +1701,15 @@ class MainWindow(QMainWindow):
         self.video_worker.start()
 
     def video_processing_finished(self, output_path):
+        self.cleanup_worker()
         self.set_ui_enabled(True)
         self.progress_bar.setVisible(False)
         self.update_after_edit(output_path)
 
     def video_processing_error(self, error_message):
-        self.set_ui_enabled(True)
+        self.cleanup_worker()
         self.progress_bar.setVisible(False)
+        self.set_ui_enabled(True)
         QMessageBox.critical(self, "Processing Error", error_message)
 
     def update_after_edit(self, new_edited_path):
@@ -1396,89 +1826,6 @@ class MainWindow(QMainWindow):
         if sliding_window_size > frame_accumulation:
             QMessageBox.critical(self, "Value Error", "The sliding window size must be less than or equal to the number of frames used!")
             return
-        
-        desired_model_name = self.model_combo.currentText()
-        if self.current_model_name != desired_model_name:
-            print(f"Model switch required. From {self.current_model_name} to {desired_model_name}.")
-            self.set_ui_enabled(False, "Switching model...")
-            QApplication.processEvents()
-
-            try:
-                if self.model is not None:
-                    print(f"Releasing old model: {self.current_model_name}")
-                    del self.model
-                    self.model = None
-                    if self.processor: del self.processor
-                    self.processor = None
-                    if self.tokenizer: del self.tokenizer
-                    self.tokenizer = None
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-                    gc.collect()
-                
-                print(f"Loading Processor...")
-                if "Qwen2.5-VL" in desired_model_name:
-                    # Temporarily fix this setting
-                    MIN_PIXELS = 224 * 28 * 28
-                    MAX_PIXELS = 840 * 28 * 28
-                    if MIN_PIXELS is not None and MAX_PIXELS is not None:
-                        self.processor = AutoProcessor.from_pretrained(
-                            desired_model_name, 
-                            torch_dtype=torch.bfloat16,
-                            trust_remote_code=True, 
-                            min_pixels=MIN_PIXELS, 
-                            max_pixels=MAX_PIXELS, 
-                        )
-                    else:
-                        self.processor = AutoProcessor.from_pretrained(
-                            desired_model_name, 
-                            torch_dtype=torch.bfloat16,
-                            trust_remote_code=True, 
-                        )
-                elif "InternVL3_5" in desired_model_name or "MiniCPM-V-4_5" in desired_model_name:
-                    pass
-                else:
-                    self.processor = AutoProcessor.from_pretrained(
-                        desired_model_name, 
-                        torch_dtype=torch.bfloat16,
-                        trust_remote_code=True, 
-                    )
-                if self.processor: self.processor.tokenizer.padding_side = "left"
-                if "InternVL3_5" in desired_model_name:
-                    self.tokenizer = AutoTokenizer.from_pretrained(
-                        desired_model_name, 
-                        trust_remote_code=True, 
-                        use_fast=False, 
-                    )
-                elif "MiniCPM-V-4_5" in desired_model_name:
-                    self.tokenizer = AutoTokenizer.from_pretrained(
-                        desired_model_name, 
-                        trust_remote_code=True, 
-                    )
-                if self.tokenizer: self.tokenizer.padding_side = "left"
-                
-                print(f"Loading new model: {desired_model_name}")
-                self.model = MODEL_MAP[desired_model_name].from_pretrained(
-                    desired_model_name, 
-                    torch_dtype=torch.bfloat16, 
-                    attn_implementation="flash_attention_2", 
-                    device_map="cuda:0", 
-                    trust_remote_code=True, 
-                ).eval()
-
-                self.current_model_name = desired_model_name
-                print(f"Successfully loaded {self.current_model_name}.")
-            except Exception as e:
-                print(e)
-                QMessageBox.critical(self, "Model Loading Error", f"Unable to load model: {e}")
-                self.set_ui_enabled(True)
-                self.model = None
-                self.processor = None
-                self.tokenizer = None
-                self.current_model_name = None
-                return
-            finally:
-                self.set_ui_enabled(True)
 
         params = {
             "video_path": inference_video_path,
@@ -1496,7 +1843,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
 
-        self.inference_worker = InferenceWorker(params, self.model, self.processor, self.tokenizer)
+        self.inference_worker = InferenceWorker(params)
         self.inference_worker.progress_signal.connect(self.update_progress)
         self.inference_worker.finished_signal.connect(self.inference_finished)
         self.inference_worker.error_signal.connect(self.inference_error)
@@ -1506,6 +1853,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(value)
 
     def inference_finished(self, output_video_path, generated_texts):
+        self.cleanup_worker()
         self.progress_bar.setVisible(False)
         self.set_ui_enabled(True)
         QMessageBox.information(self, "Finish", f"The video inference is completed!\nThe result is saved in:\n{output_video_path}")
@@ -1522,6 +1870,7 @@ class MainWindow(QMainWindow):
             self.switch_video_source("Inferred Video")
 
     def inference_error(self, error_message):
+        self.cleanup_worker()
         self.progress_bar.setVisible(False)
         self.set_ui_enabled(True)
         QMessageBox.critical(self, "Inference Error", error_message)
@@ -1643,24 +1992,22 @@ class MainWindow(QMainWindow):
             else:
                  self.video_display_label.setText("Video not available.")
 
-    def closeEvent(self, event):
+    def cleanup_worker(self):
         if self.inference_worker and self.inference_worker.isRunning():
             self.inference_worker.stop()
+            self.inference_worker.quit()
             self.inference_worker.wait()
+            self.inference_worker.deleteLater()
+            self.inference_worker = None
         if self.video_worker and self.video_worker.isRunning():
             self.video_worker.stop()
+            self.video_worker.quit()
             self.video_worker.wait()
-        if self.model is not None:
-            print(f"Releasing model {self.current_model_name} on exit.")
-            del self.model
-            self.model  = None
-            if self.processor: del self.processor
-            self.processor  = None
-            if self.tokenizer: del self.tokenizer
-            self.tokenizer  = None
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-            gc.collect()
+            self.video_worker.deleteLater()
+            self.video_worker = None
+    
+    def closeEvent(self, event):
+        self.cleanup_worker()
         self.reset_all_caps()
         try:
             shutil.rmtree(self.temp_dir)
@@ -1670,6 +2017,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn')
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE_SHEET)
     window = MainWindow()
