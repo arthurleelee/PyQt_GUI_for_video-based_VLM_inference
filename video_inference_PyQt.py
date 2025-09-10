@@ -792,9 +792,9 @@ def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
             gc.collect()
             return
         
-        class_names = [name.strip() for name in text.split('.') if name.strip()]
-        class_to_id = {name: i for i, name in enumerate(class_names)}
-        class_ids_raw = np.array([class_to_id[label] for label in labels_raw])
+        unique_labels = sorted(list(set(labels_raw)))
+        label_to_id = {label: i for i, label in enumerate(unique_labels)}
+        class_ids_raw = np.array([label_to_id[label] for label in labels_raw])
 
         detections_gd = sv.Detections(
             xyxy=boxes_raw.cpu().numpy(), 
@@ -1682,7 +1682,7 @@ class MainWindow(QMainWindow):
             "input_path": source_path,
             "output_path": output_path,
             "fps": self.gsam2_fps_spin.value(),
-            "text": self.gsam2_text_prompt_lineedit.text(), 
+            "text": text, 
             "box_color": (self.gsam2_box_color.red(), self.gsam2_box_color.green(), self.gsam2_box_color.blue()), 
             "box_thickness": self.gsam2_box_thickness_spin.value()
         }
