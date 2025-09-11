@@ -12,6 +12,7 @@ import math
 import torchvision.transforms as T
 import supervision as sv
 import multiprocessing as mp
+import signal
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
@@ -700,9 +701,10 @@ def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
         # setup the input image and text prompt for SAM 2 and Grounding DINO
         # VERY important: text queries need to be lowercased + end with a dot
         text = params["text"]
-        box_color = params["box_color"]
+        draw_color = params["draw_color"]
         box_thickness = params["box_thickness"]
 
+        cap = None
         out = None
 
         """
@@ -735,7 +737,16 @@ def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
 
         video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
         # init video predictor state
-        inference_state = video_predictor.init_state(video_path=input_path)
+        try:
+            inference_state = video_predictor.init_state(video_path=input_path)
+        except:
+            error_queue.put("Error - The problem may be that the video is too long and causes out of memory (DRAM).")
+            if cap: cap.release()
+            if out: out.close()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            gc.collect()
+            return
         sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
         image_predictor = SAM2ImagePredictor(sam2_image_model)
 
@@ -754,7 +765,7 @@ def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
                 break
             images.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
 
-        ann_frame_idx = 0  # the frame index we interact with
+        ann_frame_idx = -1  # the frame index we interact with
         ann_obj_id = 1  # give a unique id to each object we interact with (it can be any integers)
 
         progress_queue.put(20)
@@ -762,29 +773,62 @@ def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
         """
         Step 2: Prompt Grounding DINO and SAM image predictor to get the box and mask for specific frame
         """
-        # prompt grounding dino to get the box coordinates on specific frame
-        image = images[ann_frame_idx]
+        # Try Grounding DINO on every frame until objects are detected.
+        for idx in range(ann_frame_idx+1, len(images)):
+            print(f"Attempting detection on frame {idx}...")
+            # prompt grounding dino to get the box coordinates on specific frame
+            image = images[idx]
 
-        # run Grounding DINO on the image
-        inputs = processor(images=image, text=text, return_tensors="pt").to(device)
-        with torch.no_grad():
-            outputs = grounding_model(**inputs)
+            # run Grounding DINO on the image
+            inputs = processor(images=image, text=text, return_tensors="pt").to(device)
+            with torch.no_grad():
+                outputs = grounding_model(**inputs)
 
-        results = processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            box_threshold=0.25,
-            text_threshold=0.3,
-            target_sizes=[image.size[::-1]]
-        )
+            results = processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                box_threshold=0.25,
+                text_threshold=0.3,
+                target_sizes=[image.size[::-1]]
+            )
 
-        # Apply NMS
-        boxes_raw = results[0]["boxes"]
-        scores_raw = results[0]["scores"]
-        labels_raw = results[0]["labels"]
+            # Apply NMS
+            boxes_raw = results[0]["boxes"]
+            scores_raw = results[0]["scores"]
+            labels_raw = results[0]["labels"]
 
-        if boxes_raw.shape[0] == 0:
-            error_queue.put("Grounding DINO did not detect any objects!")
+            mask = np.array([label != "" for label in labels_raw])
+            boxes_raw = boxes_raw[mask]
+            scores_raw = scores_raw[mask]
+            labels_raw = [label for i, label in enumerate(labels_raw) if mask[i]]
+
+            if boxes_raw.shape[0] == 0:
+                continue
+            
+            print(f"Success! Objects are detected on frame {idx}. Starting tracking from here.")
+            ann_frame_idx = idx
+
+            unique_labels = sorted(list(set(labels_raw)))
+            label_to_id = {label: i for i, label in enumerate(unique_labels)}
+            class_ids_raw = np.array([label_to_id[label] for label in labels_raw])
+            
+            detections_gd = sv.Detections(
+                xyxy=boxes_raw.cpu().numpy(), 
+                confidence=scores_raw.cpu().numpy(), 
+                class_id=class_ids_raw, 
+                data={'labels': labels_raw}
+            )
+            NMS_IOU_THRESHOLD = 0.5
+            detections_filtered = detections_gd.with_nms(threshold=NMS_IOU_THRESHOLD)
+            print(f"Originally detect {len(detections_gd)} bounding boxes. Remain {len(detections_filtered)} bounding boxes after NMS.")
+
+            # process the detection results
+            input_boxes = detections_filtered.xyxy
+            OBJECTS = detections_filtered.data['labels']
+            break
+        
+        if ann_frame_idx == -1:
+            error_queue.put("Grounding DINO did not detect any objects on all frames! Exiting.")
             if cap: cap.release()
             if out: out.close()
             torch.cuda.empty_cache()
@@ -792,26 +836,8 @@ def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
             gc.collect()
             return
         
-        unique_labels = sorted(list(set(labels_raw)))
-        label_to_id = {label: i for i, label in enumerate(unique_labels)}
-        class_ids_raw = np.array([label_to_id[label] for label in labels_raw])
-
-        detections_gd = sv.Detections(
-            xyxy=boxes_raw.cpu().numpy(), 
-            confidence=scores_raw.cpu().numpy(), 
-            class_id=class_ids_raw, 
-            data={'labels': labels_raw}
-        )
-        NMS_IOU_THRESHOLD = 0.5 
-        detections_filtered = detections_gd.with_nms(threshold=NMS_IOU_THRESHOLD)
-        print(f"Originally detect {len(detections_gd)} bounding boxes. Remain {len(detections_filtered)} bounding boxes after NMS.")
-
         # prompt SAM image predictor to get the mask for the object
-        image_predictor.set_image(np.array(image.convert("RGB")))
-
-        # process the detection results
-        input_boxes = detections_filtered.xyxy
-        OBJECTS = detections_filtered.data['labels']
+        image_predictor.set_image(np.array(images[ann_frame_idx].convert("RGB")))
 
         progress_queue.put(40)
 
@@ -844,35 +870,54 @@ def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
         """
         Step 5: Draw the segment results and save video
         """
+        default_palette = sv.ColorPalette.DEFAULT
         ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
+        for progress, (frame_idx, segments) in enumerate(video_segments.items()):
+            img = cv2.cvtColor(np.asarray(images[frame_idx]), cv2.COLOR_RGB2BGR)
+            
+            object_ids = list(segments.keys())
+            if not object_ids:
+                continue
+
+            masks = list(segments.values())
+            masks = np.concatenate(masks, axis=0)
+            
+            detections = sv.Detections(
+                xyxy=sv.mask_to_xyxy(masks),  # (n, 4)
+                mask=masks, # (n, h, w)
+                tracker_id=np.array(object_ids, dtype=np.int32),
+            )
+            annotated_frame = img.copy()
+            if generate_box:
+                box_annotator = sv.BoxAnnotator(
+                    color=sv.Color(r=draw_color[0], g=draw_color[1], b=draw_color[2]) if len(object_ids) == 1 else default_palette, 
+                    thickness=box_thickness,
+                    color_lookup=sv.ColorLookup.TRACK
+                )
+                annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=detections)
+                if generate_label:
+                    label_annotator = sv.LabelAnnotator(
+                        color=sv.Color(r=draw_color[0], g=draw_color[1], b=draw_color[2]) if len(object_ids) == 1 else default_palette, 
+                        text_color=sv.Color.BLACK, 
+                        color_lookup=sv.ColorLookup.TRACK
+                    )
+                    annotated_frame = label_annotator.annotate(annotated_frame, detections=detections, labels=[ID_TO_OBJECTS[i] for i in object_ids])
+            if generate_mask:
+                mask_annotator = sv.MaskAnnotator(
+                    color=sv.Color(r=draw_color[0], g=draw_color[1], b=draw_color[2]) if len(object_ids) == 1 else default_palette, 
+                    color_lookup=sv.ColorLookup.TRACK
+                )
+                annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
+            images[frame_idx] = Image.fromarray(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB))
+
+            progress_queue.put(int(80 + (progress + 1) / len(video_segments) * 10))
+        
         # The QThread signal may be executed first and then "finally", so you must use "with" to close the writer.
         with imageio.get_writer(output_path, fps=fps) as out:
-            for progress, (frame_idx, segments) in enumerate(video_segments.items()):
-                img = cv2.cvtColor(np.asarray(images[frame_idx]), cv2.COLOR_RGB2BGR)
-                
-                object_ids = list(segments.keys())
-                masks = list(segments.values())
-                masks = np.concatenate(masks, axis=0)
-                
-                detections = sv.Detections(
-                    xyxy=sv.mask_to_xyxy(masks),  # (n, 4)
-                    mask=masks, # (n, h, w)
-                    class_id=np.array(object_ids, dtype=np.int32),
-                )
-                annotated_frame = img.copy()
-                if generate_box:
-                    box_annotator = sv.BoxAnnotator(color=sv.Color(r=box_color[0], g=box_color[1], b=box_color[2]), thickness=box_thickness)
-                    annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=detections)
-                    if generate_label:
-                        label_annotator = sv.LabelAnnotator()
-                        annotated_frame = label_annotator.annotate(annotated_frame, detections=detections, labels=[ID_TO_OBJECTS[i] for i in object_ids])
-                if generate_mask:
-                    mask_annotator = sv.MaskAnnotator()
-                    annotated_frame = mask_annotator.annotate(scene=annotated_frame, detections=detections)
-                annotated_frame = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                out.append_data(annotated_frame)
+            for progress, image in enumerate(images):
+                out.append_data(np.asarray(image))
 
-                progress_queue.put(int(80 + (progress + 1) / len(video_segments) * 20))
+                progress_queue.put(int(90 + (progress + 1) / len(images) * 10))
 
     except Exception as e:
         error_queue.put(e)
@@ -1104,7 +1149,7 @@ class MainWindow(QMainWindow):
         self.processed_cap = None
 
         self.draw_color = QColor(Qt.GlobalColor.red)
-        self.gsam2_box_color = QColor(Qt.GlobalColor.red)
+        self.gsam2_draw_color = QColor(Qt.GlobalColor.red)
         self.total_frames = 0
         self.video_width = 0
         self.video_height = 0
@@ -1221,27 +1266,27 @@ class MainWindow(QMainWindow):
         self.gsam2_text_prompt_lineedit = QLineEdit()
         self.gsam2_text_prompt_lineedit.setPlaceholderText("Keyword (e.g., \"person.\" or \"white car.\")")
         self.gsam2_fps_spin = QSpinBox()
-        self.gsam_note_label = QLabel("Note:\n1. This is Grounded SAM 2 Video Object Tracking.\n2. The video shouldn't be too long, otherwise it will cause out of memory.\n3. It is important that text prompt must be lowercased + end with a dot.")
+        self.gsam_note_label = QLabel("Notes:\n1. This is Grounded SAM 2 Video Object Tracking.\n2. The video shouldn't be too long, otherwise it will cause out of memory.\n3. It is important that text prompt must be lowercased + end with a dot.")
         self.gsam_note_label.setStyleSheet("color: red")
         self.apply_gsam2_btn = QPushButton("Apply Grounded-SAM2-Tracking")
         self.apply_gsam2_btn.clicked.connect(self.apply_Grounded_SAM2)
         self.gsam2_box_thickness_spin = QSpinBox()
         self.gsam2_box_thickness_spin.setValue(3)
         
-        gsam2_box_color_layout = QHBoxLayout()
-        self.gsam2_box_pick_color_btn = QPushButton("Pick Boxes Color")
+        gsam2_draw_color_layout = QHBoxLayout()
+        self.gsam2_box_pick_color_btn = QPushButton("Pick Draw Color (If Only One Object Is Detected)")
         self.gsam2_box_pick_color_btn.clicked.connect(self.gsam2_box_pick_color)
-        self.gsam2_box_color_preview_label = QLabel()
-        self.gsam2_box_color_preview_label.setFixedSize(50, 20)
+        self.gsam2_draw_color_preview_label = QLabel()
+        self.gsam2_draw_color_preview_label.setFixedSize(50, 20)
         self.gsam2_box_update_color_preview()
-        gsam2_box_color_layout.addWidget(self.gsam2_box_pick_color_btn)
-        gsam2_box_color_layout.addWidget(self.gsam2_box_color_preview_label)
+        gsam2_draw_color_layout.addWidget(self.gsam2_box_pick_color_btn)
+        gsam2_draw_color_layout.addWidget(self.gsam2_draw_color_preview_label)
         
         gsam2_layout.addRow("Generated Type:", self.gsam_option_combo)
         gsam2_layout.addRow("Text Prompt:", self.gsam2_text_prompt_lineedit)
         gsam2_layout.addRow("FPS of the edited video:", self.gsam2_fps_spin)
         gsam2_layout.addRow("Boxes Thickness:", self.gsam2_box_thickness_spin)
-        gsam2_layout.addRow(gsam2_box_color_layout)
+        gsam2_layout.addRow(gsam2_draw_color_layout)
         gsam2_layout.addRow(self.gsam_note_label)
         gsam2_layout.addRow(self.apply_gsam2_btn)
         
@@ -1252,7 +1297,7 @@ class MainWindow(QMainWindow):
         self.edit_tabs.addTab(gsam2_widget, "Grounded-SAM2")
         
         edit_buttons_layout = QHBoxLayout()
-        self.save_edited_btn = QPushButton("Save Edited Video As...")
+        self.save_edited_btn = QPushButton("Save Edited Video")
         self.save_edited_btn.clicked.connect(self.save_edited_video)
         self.save_edited_btn.setEnabled(False)
         self.reset_edits_btn = QPushButton("Reset All Edits")
@@ -1644,13 +1689,13 @@ class MainWindow(QMainWindow):
     def gsam2_box_pick_color(self):
         color = QColorDialog.getColor()
         if color.isValid():
-            self.gsam2_box_color = color
+            self.gsam2_draw_color = color
             self.gsam2_box_update_color_preview()
 
     def gsam2_box_update_color_preview(self):
-        pixmap = QPixmap(self.gsam2_box_color_preview_label.size())
-        pixmap.fill(self.gsam2_box_color)
-        self.gsam2_box_color_preview_label.setPixmap(pixmap)
+        pixmap = QPixmap(self.gsam2_draw_color_preview_label.size())
+        pixmap.fill(self.gsam2_draw_color)
+        self.gsam2_draw_color_preview_label.setPixmap(pixmap)
 
     def apply_Grounded_SAM2(self):
         source_path = self.get_current_editing_source_path()
@@ -1683,7 +1728,7 @@ class MainWindow(QMainWindow):
             "output_path": output_path,
             "fps": self.gsam2_fps_spin.value(),
             "text": text, 
-            "box_color": (self.gsam2_box_color.red(), self.gsam2_box_color.green(), self.gsam2_box_color.blue()), 
+            "draw_color": (self.gsam2_draw_color.red(), self.gsam2_draw_color.green(), self.gsam2_draw_color.blue()), 
             "box_thickness": self.gsam2_box_thickness_spin.value()
         }
         params |= generated_type_map[self.gsam_option_combo.currentText()]
@@ -1992,13 +2037,19 @@ class MainWindow(QMainWindow):
             else:
                  self.video_display_label.setText("Video not available.")
 
-    def cleanup_worker(self):
+    def cleanup_worker(self, kill=False):
+        if kill and self.inference_worker and self.inference_worker.process.is_alive():
+            os.kill(self.inference_worker.process.pid, signal.SIGKILL)
+            self.inference_worker.process.join()
         if self.inference_worker and self.inference_worker.isRunning():
             self.inference_worker.stop()
             self.inference_worker.quit()
             self.inference_worker.wait()
             self.inference_worker.deleteLater()
             self.inference_worker = None
+        if kill and self.video_worker and self.video_worker.process.is_alive():
+            os.kill(self.video_worker.process.pid, signal.SIGKILL)
+            self.video_worker.process.join()
         if self.video_worker and self.video_worker.isRunning():
             self.video_worker.stop()
             self.video_worker.quit()
@@ -2007,7 +2058,7 @@ class MainWindow(QMainWindow):
             self.video_worker = None
     
     def closeEvent(self, event):
-        self.cleanup_worker()
+        self.cleanup_worker(kill=True)
         self.reset_all_caps()
         try:
             shutil.rmtree(self.temp_dir)
