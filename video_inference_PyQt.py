@@ -739,8 +739,8 @@ def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
         # init video predictor state
         try:
             inference_state = video_predictor.init_state(video_path=input_path)
-        except:
-            error_queue.put("Error - The problem may be that the video is too long and causes out of memory (DRAM).")
+        except Exception as e:
+            error_queue.put(f"Error - {e} or The problem may be that the video is too long and causes out of memory (DRAM).")
             if cap: cap.release()
             if out: out.close()
             torch.cuda.empty_cache()
