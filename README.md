@@ -76,6 +76,12 @@ pip install ./Grounded-SAM-2
 **Option B: Using `uv`**
 
 ```bash
+# Create the virtual environment
+uv venv --python 3.10
+
+# Activate the virtual environment
+source .venv/bin/activate
+
 # Synchronize the virtual environment with pyproject.toml
 uv sync
 

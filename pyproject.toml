@@ -1,9 +1,9 @@
 [project]
-name = "video-stream-inference"
-version = "0.1.0"
-description = "Add your description here"
+name = "video-vlm-gui"
+version = "1.0.0"
+description = "A PyQt GUI application for video-based inference using vision-language models (VLMs) and video editing with AI features like Grounded-SAM 2 object tracking."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "==3.10.*"
 dependencies = [
     "accelerate==1.4.0",
     "av==14.4.0",
@@ -26,6 +26,7 @@ dependencies = [
     "num2words>=0.5.14",
     "numba==0.61.2",
     "numpy==2.2.6",
+    "nvidia-ml-py==13.580.82",
     "opencv-python==4.12.0.88",
     "pandas==2.2.2",
     "pathlib==1.0.1",
