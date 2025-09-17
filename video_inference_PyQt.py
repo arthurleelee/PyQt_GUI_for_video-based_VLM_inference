@@ -31,6 +31,7 @@ from scipy.spatial import cKDTree
 from ffmpeg_progress_yield import FfmpegProgress
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+from pynvml import *
 
 
 STYLE_SHEET = """
@@ -96,21 +97,32 @@ QTextEdit:focus, QSpinBox:focus, QComboBox:focus {
     border: 1px solid #39ff14;
 }
 
-/* QSpinBox */
+/* QSpinBox*/
 QSpinBox::up-button, QSpinBox::down-button {
     subcontrol-origin: border;
-    background-color: #333333;
+    background-color: #525252;
+    border-radius: 4px;
     border-left: 1px solid #242424;
     width: 20px;
 }
 QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-    background-color: #404040;
+    background-color: #39ff14;
 }
 QSpinBox::up-button {
     subcontrol-position: top right;
+    margin-bottom: 1px;
 }
 QSpinBox::down-button {
     subcontrol-position: bottom right;
+    margin-top: 1px;
+}
+
+/* ComboBox */
+QComboBox:hover {
+    border: 1px solid #39ff14;
+}
+QComboBox::item:selected {
+    border: 1px solid #39ff14;
 }
 
 /* Slider */
@@ -523,7 +535,7 @@ class VLM_Inference():
                     model_name, 
                     torch_dtype=torch.bfloat16, 
                     attn_implementation="flash_attention_2", 
-                    device_map="cuda:0", 
+                    device_map=f"cuda:{torch.cuda.current_device()}", 
                     trust_remote_code=True, 
                 ).eval()
                 print(f"Successfully loaded {model_name}.")
@@ -733,7 +745,7 @@ def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
                 error_queue.put(f"An error occurred: {e.stderr.decode()}\n" + f"Failed to download {sam2_checkpoint} checkpoint.")
                 return
 
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+        torch.autocast(device_type=f"cuda:{torch.cuda.current_device()}", dtype=torch.bfloat16).__enter__()
 
         video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
         # init video predictor state
@@ -752,7 +764,7 @@ def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
 
         # init grounding dino model from huggingface
         model_id = "IDEA-Research/grounding-dino-base"
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = f"cuda:{torch.cuda.current_device()}"
         processor = AutoProcessor.from_pretrained(model_id)
         grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
 
@@ -1162,7 +1174,25 @@ class MainWindow(QMainWindow):
         self.video_worker = None
         self.inference_data = []
 
+        self.gpuinfo_initialized = False
+        self.total_vram_gb = 0
+        self.handle = None
+        self.init_gpuinfo()
+
         self.initUI()
+    
+    def init_gpuinfo(self):
+        try:
+            nvmlInit()
+            current_device_index = torch.cuda.current_device()
+            self.handle = nvmlDeviceGetHandleByIndex(current_device_index)
+            info = nvmlDeviceGetMemoryInfo(self.handle)
+            self.total_vram_gb = info.total / (1024**3)
+            self.gpuinfo_initialized = True
+            print(f"Successfully initialized info for GPU {current_device_index}. Total VRAM: {self.total_vram_gb:.2f} GB")
+        except Exception as e:
+            print(f"Failed to initialize pynvml: {e}")
+            self.nvml_initialized = False
 
     def initUI(self):
         main_widget = QWidget()
@@ -1371,10 +1401,17 @@ class MainWindow(QMainWindow):
 
         action_group = QGroupBox("5. Execute and Results")
         action_layout = QFormLayout()
+        action_buttons_layout = QHBoxLayout()
         self.start_inference_btn = QPushButton("Start to Infer")
         self.start_inference_btn.setEnabled(False)
         self.start_inference_btn.clicked.connect(self.start_inference)
-        action_layout.addRow(self.start_inference_btn)
+        self.stop_inference_or_editing_btn = QPushButton("Stop Inference or Editing")
+        self.stop_inference_or_editing_btn.setEnabled(False)
+        self.stop_inference_or_editing_btn.setVisible(False)
+        self.stop_inference_or_editing_btn.clicked.connect(self.stop_inference_or_editing)
+        action_buttons_layout.addWidget(self.start_inference_btn)
+        action_buttons_layout.addWidget(self.stop_inference_or_editing_btn)
+        action_layout.addRow(action_buttons_layout)
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         action_layout.addRow(self.progress_bar)
@@ -1457,10 +1494,51 @@ class MainWindow(QMainWindow):
         playback_controls.addWidget(QLabel("Video Type:"))
         playback_controls.addWidget(self.video_source_combo)
 
+        vram_layout = QVBoxLayout()
+        vram_info_layout = QHBoxLayout()
+        self.vram_label = QLabel("Current GPU VRAM usage of the device (GB):")
+        self.vram_label.setStyleSheet("color: #39ff14")
+        vram_info_layout.addWidget(self.vram_label)
+        self.vram_usage_label = QLabel("N/A")
+        self.vram_usage_label.setStyleSheet("color: #39ff14")
+        vram_info_layout.addWidget(self.vram_usage_label)
+        vram_info_layout.addStretch()
+        self.vram_progress_bar = QProgressBar()
+        self.vram_progress_bar.setRange(0, 500)
+        # self.vram_progress_bar.setTextVisible(False)
+        vram_layout.addLayout(vram_info_layout)
+        vram_layout.addWidget(self.vram_progress_bar)
+
+        self.vram_timer = QTimer(self)
+        self.vram_timer.timeout.connect(self.update_vram_display)
+        self.vram_timer.start(500)
+        self.update_vram_display()
+
         right_layout.addWidget(self.video_display_label, 1)
         right_layout.addWidget(playback_slider_group)
         right_layout.addLayout(playback_controls)
+        right_layout.addLayout(vram_layout)
+
         main_layout.addWidget(right_panel, 1)
+
+    def update_vram_display(self):
+        if not self.gpuinfo_initialized:
+            self.vram_usage_label.setText("N/A (NVIDIA GPU Not Found)")
+            self.vram_progress_bar.setEnabled(False)
+            return
+
+        try:
+            info = nvmlDeviceGetMemoryInfo(self.handle)
+            used_gb = info.used / (1024**3)
+        except Exception as e:
+            self.vram_usage_label.setText("Error reading VRAM")
+            print(f"Could not update VRAM info: {e}")
+            self.nvml_initialized = False
+        
+        self.vram_usage_label.setText(f"{used_gb:.2f} / {self.total_vram_gb:.2f} GB")
+        percentage = (used_gb / self.total_vram_gb) * 500
+        self.vram_progress_bar.setValue(int(percentage))
+        self.vram_progress_bar.setToolTip(f"{used_gb:.2f}/{self.total_vram_gb:.2f} GB ({percentage/10:.1f}%)")
     
     def update_pixel_coords(self, pos):
         if not self.video_display_label.pixmap() or self.video_display_label.pixmap().isNull():
@@ -1698,6 +1776,12 @@ class MainWindow(QMainWindow):
         self.gsam2_draw_color_preview_label.setPixmap(pixmap)
 
     def apply_Grounded_SAM2(self):
+        if not self.gpuinfo_initialized:
+            QMessageBox.critical(self, "GPU Error",
+                                 "Cannot start Grounded-SAM2 because the NVIDIA GPU could not be detected or initialized.\n\n"
+                                 "Please ensure NVIDIA drivers are correctly installed and working.")
+            return
+        
         source_path = self.get_current_editing_source_path()
         if not source_path: return
 
@@ -1819,9 +1903,12 @@ class MainWindow(QMainWindow):
         self.edit_tabs.setEnabled(enabled)
         self.load_video_btn.setEnabled(enabled)
         self.start_inference_btn.setEnabled(enabled)
+        self.stop_inference_or_editing_btn.setVisible(not enabled)
+        self.stop_inference_or_editing_btn.setEnabled(not enabled)
         self.save_edited_btn.setEnabled(enabled and self.edited_video_path is not None)
         self.reset_edits_btn.setEnabled(enabled and self.edited_video_path is not None)
         self.status_label.setText(status_text)
+        self.setFocus()
         QApplication.processEvents()
 
     def reset_all_caps(self):
@@ -1847,6 +1934,12 @@ class MainWindow(QMainWindow):
         self.end_frame_slider.setValue(current_pos)
 
     def start_inference(self):
+        if not self.gpuinfo_initialized:
+            QMessageBox.critical(self, "GPU Error",
+                                 "Cannot start inference because the NVIDIA GPU could not be detected or initialized.\n\n"
+                                 "Please ensure NVIDIA drivers are correctly installed and working.")
+            return
+        
         inference_source = self.inference_source_combo.currentText()
         if inference_source == "Original Video":
             inference_video_path = self.video_path
@@ -1893,6 +1986,15 @@ class MainWindow(QMainWindow):
         self.inference_worker.finished_signal.connect(self.inference_finished)
         self.inference_worker.error_signal.connect(self.inference_error)
         self.inference_worker.start()
+
+    def stop_inference_or_editing(self):
+        self.status_label.setText("Stopping inference or editing...")
+        QApplication.processEvents()
+        self.cleanup_worker(kill=True)
+        print("Inference or editing operation was terminated. Ignore the above error message.")
+        self.progress_bar.setVisible(False)
+        self.set_ui_enabled(True)
+        QMessageBox.information(self, "Successfully Stop", f"Inference or editing operation was terminated.")
 
     def update_progress(self, value):
         self.progress_bar.setValue(value)
@@ -1984,7 +2086,7 @@ class MainWindow(QMainWindow):
         if self.current_video_source == "processed" and self.inference_data and frame_number < len(self.inference_data):
             original_video_frame_number = self.inference_data[frame_number]["current_frame"]
             generated_text = self.inference_data[frame_number]["text"]
-            self.inference_text_display.setText(f"This frame {frame_number} corresponds to frame {original_video_frame_number} of the original video.\nGenerated Text:\n{generated_text}")
+            self.inference_text_display.setText(f"This frame {frame_number} corresponds to frame {original_video_frame_number} of the {self.inference_source_combo.currentText().lower()}.\nGenerated Text:\n{generated_text}")
         elif self.current_video_source != "processed":
             self.inference_text_display.clear()
 
@@ -2047,7 +2149,7 @@ class MainWindow(QMainWindow):
             self.inference_worker.wait()
             self.inference_worker.deleteLater()
             self.inference_worker = None
-        if kill and self.video_worker and self.video_worker.process.is_alive():
+        if kill and self.video_worker and hasattr(self.video_worker, "process") and self.video_worker.process.is_alive():
             os.kill(self.video_worker.process.pid, signal.SIGKILL)
             self.video_worker.process.join()
         if self.video_worker and self.video_worker.isRunning():
