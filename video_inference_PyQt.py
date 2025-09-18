@@ -492,8 +492,8 @@ class VLM_Inference():
                 print(f"Loading Processor...")
                 if "Qwen2.5-VL" in model_name:
                     # Temporarily fix this setting
-                    MIN_PIXELS = 224 * 28 * 28
-                    MAX_PIXELS = 840 * 28 * 28
+                    MIN_PIXELS = None # 224 * 28 * 28
+                    MAX_PIXELS = None # 840 * 28 * 28
                     if MIN_PIXELS is not None and MAX_PIXELS is not None:
                         self.processor = AutoProcessor.from_pretrained(
                             model_name, 
@@ -882,7 +882,7 @@ def run_Grounded_SAM2_steps(params, progress_queue, error_queue):
         """
         Step 5: Draw the segment results and save video
         """
-        default_palette = sv.ColorPalette.DEFAULT
+        default_palette = sv.ColorPalette.LEGACY
         ID_TO_OBJECTS = {i: obj for i, obj in enumerate(OBJECTS, start=1)}
         for progress, (frame_idx, segments) in enumerate(video_segments.items()):
             img = cv2.cvtColor(np.asarray(images[frame_idx]), cv2.COLOR_RGB2BGR)
