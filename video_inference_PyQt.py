@@ -1157,6 +1157,8 @@ class MainWindow(QMainWindow):
         self.edited_cap = None
         self.temp_dir = os.path.join(os.getcwd(), "video_modification_temp")
         os.makedirs(self.temp_dir, exist_ok=True)
+        self.undo_stack = []
+        self.redo_stack = []
 
         self.processed_cap = None
 
@@ -1327,14 +1329,26 @@ class MainWindow(QMainWindow):
         self.edit_tabs.addTab(gsam2_widget, "Grounded-SAM2")
         
         edit_buttons_layout = QHBoxLayout()
-        self.save_edited_btn = QPushButton("Save Edited Video")
-        self.save_edited_btn.clicked.connect(self.save_edited_video)
-        self.save_edited_btn.setEnabled(False)
+        self.undo_btn = QPushButton("Undo")
+        self.undo_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack))
+        self.undo_btn.clicked.connect(self.undo_edit)
+        self.undo_btn.setEnabled(False)
+        edit_buttons_layout.addWidget(self.undo_btn)
+        self.redo_btn = QPushButton("Redo")
+        self.redo_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowForward))
+        self.redo_btn.clicked.connect(self.redo_edit)
+        self.redo_btn.setEnabled(False)
+        edit_buttons_layout.addWidget(self.redo_btn)
         self.reset_edits_btn = QPushButton("Reset All Edits")
+        self.reset_edits_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.reset_edits_btn.clicked.connect(self.reset_edits)
         self.reset_edits_btn.setEnabled(False)
-        edit_buttons_layout.addWidget(self.save_edited_btn)
         edit_buttons_layout.addWidget(self.reset_edits_btn)
+        self.save_edited_btn = QPushButton("Save Edited Video")
+        self.save_edited_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        self.save_edited_btn.clicked.connect(self.save_edited_video)
+        self.save_edited_btn.setEnabled(False)
+        edit_buttons_layout.addWidget(self.save_edited_btn)
         
         edit_layout.addWidget(self.edit_tabs)
         edit_layout.addLayout(edit_buttons_layout)
@@ -1386,11 +1400,13 @@ class MainWindow(QMainWindow):
         prompt_layout = QVBoxLayout()
         self.system_prompt_edit = QTextEdit()
         self.system_prompt_edit.setPlaceholderText("Please input system prompt...")
-        self.system_prompt_edit.setText("You are a helpful assistant.")
+        # self.system_prompt_edit.setText("You are a helpful assistant.")
+        self.system_prompt_edit.setText("You are a precise visual reasoning assistant. Focus **only** on the person inside the red box. Ignore **all other people, objects, or tools** in the frame, even if they are close or visible. Your task is to identify **only the tool being used by the person inside the red box**. If no tool is visible or if the tool cannot be clearly identified, return 'Unknown'. Do **not** consider tools being used by others, regardless of their proximity. Do **not** guess or provide explanations. Keep your response concise and in the specified format.")
         self.system_prompt_edit.setMaximumHeight(120)
         self.user_prompt_edit = QTextEdit()
         self.user_prompt_edit.setPlaceholderText("Please input user prompt...")
-        self.user_prompt_edit.setText("Describe the video.")
+        # self.user_prompt_edit.setText("Describe the video.")
+        self.user_prompt_edit.setText("Analyze the given video frame. Focus only on the person inside the red box.\nIdentify the tool being used by this person, if any, from the following options: [Drill, Marker Pen, Brush or Cotton Swab for Oiling, Scanner, Small Manual Wrench, Unknown]. If no tool is being used or the tool cannot be identified, return 'Unknown'.\n\nOutput format:\nTool: <your answer>")
         self.user_prompt_edit.setMaximumHeight(120)
         prompt_layout.addWidget(QLabel("System Prompt:"))
         prompt_layout.addWidget(self.system_prompt_edit)
@@ -1567,13 +1583,16 @@ class MainWindow(QMainWindow):
         else:
             self.video_display_label.setToolTip("")
     
-    def cleanup_temp_files(self):
-        if self.edited_video_path and os.path.exists(self.edited_video_path):
-            try:
-                os.remove(self.edited_video_path)
-            except OSError as e:
-                print(f"Error removing temp file {self.edited_video_path}: {e}")
-        self.edited_video_path = None
+    def cleanup_temp_files(self, keep_history=None):
+        if keep_history is None:
+            keep_history = []
+        history_files = {os.path.basename(p) for p in keep_history if p and self.video_path not in p}
+        for filename in os.listdir(self.temp_dir):
+            if filename not in history_files:
+                try:
+                    os.remove(os.path.join(self.temp_dir, filename))
+                except OSError as e:
+                    print(f"Error removing temp file {os.path.join(self.temp_dir, filename)}: {e}")
 
     def edit_tabs_range_and_value_setting(self):
         if self.edited_cap:
@@ -1627,6 +1646,9 @@ class MainWindow(QMainWindow):
 
         self.reset_all_caps()
         self.cleanup_temp_files()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.update_undo_redo_buttons()
         self.inference_data = []
         self.inference_text_display.clear()
         
@@ -1818,7 +1840,26 @@ class MainWindow(QMainWindow):
         params |= generated_type_map[self.gsam_option_combo.currentText()]
         self.video_processing_start(params, "Applying Grounded-SAM2-Tracking...")
         
+    def update_undo_redo_buttons(self):
+        self.undo_btn.setEnabled(bool(self.undo_stack))
+        self.redo_btn.setEnabled(bool(self.redo_stack))
+
+    def undo_edit(self):
+        current_path = self.get_current_editing_source_path()
+        self.redo_stack.append(current_path)
+        previous_path = self.undo_stack.pop()
+        self.update_after_edit(previous_path, from_undo_redo=True)
+
+    def redo_edit(self):
+        current_path = self.get_current_editing_source_path()
+        self.undo_stack.append(current_path)
+        next_path = self.redo_stack.pop()
+        self.update_after_edit(next_path, from_undo_redo=True)
+    
     def video_processing_start(self, params, status_text):
+        current_source_path = self.get_current_editing_source_path()
+        self.undo_stack.append(current_source_path)
+        self.redo_stack.clear()
         self.set_ui_enabled(False, status_text)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -1836,18 +1877,23 @@ class MainWindow(QMainWindow):
         self.update_after_edit(output_path)
 
     def video_processing_error(self, error_message):
+        if self.undo_stack:
+            self.undo_stack.pop()
+        self.update_undo_redo_buttons()
         self.cleanup_worker()
         self.progress_bar.setVisible(False)
         self.set_ui_enabled(True)
         QMessageBox.critical(self, "Processing Error", error_message)
 
-    def update_after_edit(self, new_edited_path):
-        self.cleanup_temp_files()
-        self.edited_video_path = new_edited_path
+    def update_after_edit(self, new_edited_path, from_undo_redo=False):
+        if new_edited_path == self.video_path:
+            self.reset_edits(is_undo=True)
+            self.update_undo_redo_buttons()
+            return
         
         if self.edited_cap and self.edited_cap.isOpened():
             self.edited_cap.release()
-        
+        self.edited_video_path = new_edited_path
         self.edited_cap = cv2.VideoCapture(self.edited_video_path)
         if not self.edited_cap.isOpened():
             QMessageBox.critical(self, "Error", "Failed to open the edited video.")
@@ -1866,9 +1912,18 @@ class MainWindow(QMainWindow):
         self.switch_video_source("Edited Video")
         self.edit_tabs_range_and_value_setting()
         self.start_and_end_frame_slider_setting()
+
+        if from_undo_redo:
+            self.update_undo_redo_buttons()
     
-    def reset_edits(self):
-        self.cleanup_temp_files()
+    def reset_edits(self, is_undo=False):
+        if not is_undo:
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            QMessageBox.information(self, "Success", "All edits have been reset.")
+        
+        self.cleanup_temp_files(keep_history=self.undo_stack + self.redo_stack)
+        self.edited_video_path = None
         if self.edited_cap:
             self.edited_cap.release()
             self.edited_cap = None
@@ -1883,7 +1938,7 @@ class MainWindow(QMainWindow):
         self.edit_tabs_range_and_value_setting()
         self.inference_source_combo.setCurrentIndex(0)
         self.start_and_end_frame_slider_setting()
-        QMessageBox.information(self, "Success", "All edits have been reset.")
+        self.update_undo_redo_buttons()
 
     def save_edited_video(self):
         if not self.edited_video_path or not os.path.exists(self.edited_video_path):
@@ -1905,8 +1960,13 @@ class MainWindow(QMainWindow):
         self.start_inference_btn.setEnabled(enabled)
         self.stop_inference_or_editing_btn.setVisible(not enabled)
         self.stop_inference_or_editing_btn.setEnabled(not enabled)
-        self.save_edited_btn.setEnabled(enabled and self.edited_video_path is not None)
+        if enabled:
+            self.update_undo_redo_buttons()
+        else:
+            self.undo_btn.setEnabled(False)
+            self.redo_btn.setEnabled(False)
         self.reset_edits_btn.setEnabled(enabled and self.edited_video_path is not None)
+        self.save_edited_btn.setEnabled(enabled and self.edited_video_path is not None)
         self.status_label.setText(status_text)
         self.setFocus()
         QApplication.processEvents()
