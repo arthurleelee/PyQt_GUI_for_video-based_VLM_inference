@@ -27,8 +27,9 @@ This is a powerful and intuitive graphical user interface (GUI) application buil
 
 Before you begin, ensure you have the following installed and configured on your system.
 
-* **GPU**: An NVIDIA GPU with at least **24 GB of VRAM** is highly recommended for smooth operation, especially for the Grounded-SAM 2 and video understanding features.
+* **GPU**: An NVIDIA GPU with at least **24 GB of VRAM** is highly recommended for smooth operation, especially for the Grounded-SAM 2 and VLMs.
 * **NVIDIA CUDA Toolkit**: You must have **NVIDIA CUDA Toolkit 12.4** or newer installed.
+* **FFmpeg**: Version 3.1 or higher must be installed and accessible via the system's `$PATH` environment variable. You can verify this by running `ffmpeg -version` in your terminal.
 * **GUI Environment**: A desktop environment is required to run the application. Ensure the `DISPLAY` environment variable is set.
 
 ---
