@@ -483,7 +483,7 @@ class VLM_Inference():
             end_frame = self.params["end_frame"]
             output_fps = self.params["output_fps"]
             frame_accumulation = self.params["frame_accumulation"]
-            sliding_window_size = self.params["sliding_window_size"]
+            stride_size = self.params["stride_size"]
             system_prompt = self.params["system_prompt"]
             user_prompt = self.params["user_prompt"]
             model_name = self.params["model_name"]
@@ -594,7 +594,7 @@ class VLM_Inference():
                     if len(queue) >= frame_accumulation:
                         inference_text = self.run_inference_on_frames(queue, input_fps, current_frame_index)
 
-                        for index in range(-sliding_window_size, 0):
+                        for index in range(-stride_size, 0):
                             image = self.frame_process(queue[index], inference_text)
                             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                             self.out.append_data(image)
@@ -604,9 +604,9 @@ class VLM_Inference():
                                 "text": inference_text
                             })
                         
-                        for _ in range(sliding_window_size):
+                        for _ in range(stride_size):
                             queue.popleft()
-                    elif len(queue) <= frame_accumulation - sliding_window_size:
+                    elif len(queue) <= frame_accumulation - stride_size:
                         image = self.frame_process(frame, "None")
                         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                         self.out.append_data(image)
@@ -620,8 +620,8 @@ class VLM_Inference():
                     progress = int((current_frame_index - start_frame) / total_inference_frames * 100)
                     self.progress_queue.put(progress)
 
-                if len(queue) > frame_accumulation - sliding_window_size:
-                    for index in range(-(len(queue) - frame_accumulation + sliding_window_size), 0):
+                if len(queue) > frame_accumulation - stride_size:
+                    for index in range(-(len(queue) - frame_accumulation + stride_size), 0):
                         image = self.frame_process(queue[index], "None")
                         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                         self.out.append_data(image)
@@ -1382,16 +1382,16 @@ class MainWindow(QMainWindow):
         self.accumulation_spinbox = QSpinBox()
         self.accumulation_spinbox.setRange(1, 300)
         self.accumulation_spinbox.setValue(10)
-        self.sliding_window_spinbox = QSpinBox()
-        self.sliding_window_spinbox.setRange(1, 100)
-        self.sliding_window_spinbox.setValue(2)
+        self.stride_spinbox = QSpinBox()
+        self.stride_spinbox.setRange(1, 100)
+        self.stride_spinbox.setValue(2)
         self.model_combo = QComboBox()
         self.model_combo.addItems(list(MODEL_MAP.keys()))
         params_form_layout.addRow("Inference start frame:", start_frame_layout)
         params_form_layout.addRow("Inference end frame:", end_frame_layout)
         params_form_layout.addRow("FPS of the generated video:", self.fps_spinbox)
-        params_form_layout.addRow("The number of frames used for one inference:", self.accumulation_spinbox)
-        params_form_layout.addRow("One Inference every N frames (sliding window size):", self.sliding_window_spinbox)
+        params_form_layout.addRow("The number of frames used \nfor one inference: (sliding window size)", self.accumulation_spinbox)
+        params_form_layout.addRow("How many images to wait \nfor to make an inference: (stride)", self.stride_spinbox)
         params_form_layout.addRow("Choose a model:", self.model_combo)
         params_group.setLayout(params_form_layout)
         left_layout.addWidget(params_group)
@@ -2018,8 +2018,8 @@ class MainWindow(QMainWindow):
             return
 
         frame_accumulation = self.accumulation_spinbox.value()
-        sliding_window_size = self.sliding_window_spinbox.value()
-        if sliding_window_size > frame_accumulation:
+        stride_size = self.stride_spinbox.value()
+        if stride_size > frame_accumulation:
             QMessageBox.critical(self, "Value Error", "The sliding window size must be less than or equal to the number of frames used!")
             return
 
@@ -2029,7 +2029,7 @@ class MainWindow(QMainWindow):
             "end_frame": end_frame,
             "output_fps": self.fps_spinbox.value(),
             "frame_accumulation": frame_accumulation,
-            "sliding_window_size": sliding_window_size,
+            "stride_size": stride_size,
             "system_prompt": self.system_prompt_edit.toPlainText(),
             "user_prompt": self.user_prompt_edit.toPlainText(),
             "model_name": self.model_combo.currentText(),
