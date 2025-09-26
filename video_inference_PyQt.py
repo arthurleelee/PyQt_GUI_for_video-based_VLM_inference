@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QLabel, QFileDialog, QSlider, QSpinBox, QComboBox, QTextEdit, 
     QGroupBox, QFormLayout, QMessageBox, QProgressBar, QStyle, QSizePolicy, 
-    QTabWidget, QColorDialog, QScrollArea, QLineEdit, QProgressDialog
+    QTabWidget, QColorDialog, QScrollArea, QLineEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt6.QtGui import QImage, QPixmap, QColor
@@ -1144,52 +1144,6 @@ class VideoDisplayLabel(QLabel):
         self.original_video_size = size
 
 
-class VideoValidatorThread(QThread):
-    progress_update = pyqtSignal(int)
-    validation_finished = pyqtSignal(bool, int, str) # is_valid, readable_frames, error_message
-
-    def __init__(self, video_path, parent=None):
-        super().__init__(parent)
-        self.video_path = video_path
-        self._is_running = True
-    
-    def stop(self):
-        self._is_running = False
-
-    def run(self):
-        cap = None
-        try:
-            cap = cv2.VideoCapture(self.video_path)
-            if not self._is_running or not cap.isOpened():
-                self.validation_finished.emit(False, 0, "Could not open the video file.")
-                return
-
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if total_frames == 0:
-                self.validation_finished.emit(False, 0, "Video file contains no frames.")
-                return
-
-            readable_frames = 0
-            while self._is_running:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                readable_frames += 1
-                progress = int((readable_frames / total_frames) * 100)
-                self.progress_update.emit(progress)
-            
-            if not self._is_running:
-                return
-
-            is_valid = (readable_frames == total_frames)
-            error_msg = "" if is_valid else f"File may be corrupt. Header reports {total_frames} frames, but only {readable_frames} were readable."
-            self.validation_finished.emit(is_valid, readable_frames, error_msg)
-
-        finally:
-            if cap:
-                cap.release()
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1446,13 +1400,11 @@ class MainWindow(QMainWindow):
         prompt_layout = QVBoxLayout()
         self.system_prompt_edit = QTextEdit()
         self.system_prompt_edit.setPlaceholderText("Please input system prompt...")
-        # self.system_prompt_edit.setText("You are a helpful assistant.")
-        self.system_prompt_edit.setText("You are a precise visual reasoning assistant. Focus **only** on the person inside the red box. Ignore **all other people, objects, or tools** in the frame, even if they are close or visible. Your task is to identify **only the tool being used by the person inside the red box**. If no tool is visible or if the tool cannot be clearly identified, return 'Unknown'. Do **not** consider tools being used by others, regardless of their proximity. Do **not** guess or provide explanations. Keep your response concise and in the specified format.")
+        self.system_prompt_edit.setText("You are a helpful assistant.")
         self.system_prompt_edit.setMaximumHeight(120)
         self.user_prompt_edit = QTextEdit()
         self.user_prompt_edit.setPlaceholderText("Please input user prompt...")
-        # self.user_prompt_edit.setText("Describe the video.")
-        self.user_prompt_edit.setText("Analyze the given video frame. Focus only on the person inside the red box.\nIdentify the tool being used by this person, if any, from the following options: [Drill, Marker Pen, Brush or Cotton Swab for Oiling, Scanner, Small Manual Wrench, Unknown]. If no tool is being used or the tool cannot be identified, return 'Unknown'.\n\nOutput format:\nTool: <your answer>")
+        self.user_prompt_edit.setText("Describe the video.")
         self.user_prompt_edit.setMaximumHeight(120)
         prompt_layout.addWidget(QLabel("System Prompt:"))
         prompt_layout.addWidget(self.system_prompt_edit)
@@ -1687,46 +1639,8 @@ class MainWindow(QMainWindow):
         if not path:
             return
         
-        self.temp_path = path
-        
-        progress_dialog = QProgressDialog("Validating video, please wait...", "Cancel", 0, 100, self)
-        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        progress_dialog.setWindowTitle("Video Validation")
-        
-        self.validator_thread = VideoValidatorThread(self.temp_path)
-        self.validator_thread.progress_update.connect(progress_dialog.setValue)
-        self.validator_thread.validation_finished.connect(self.on_validation_finished)
-        
-        self.validation_canceled = False
-        progress_dialog.canceled.connect(self.cancel_validation)
-        
-        self.validator_thread.start()
-        progress_dialog.exec()
-    
-    def cancel_validation(self):
-        print("Validation canceled by user.")
-        self.validation_canceled = True
-        if hasattr(self, 'validator_thread') and self.validator_thread.isRunning():
-            self.validator_thread.stop()
-
-    def on_validation_finished(self, is_valid, readable_frames, error_message):
-        if self.validation_canceled:
-            return
-        
-        for widget in QApplication.topLevelWidgets():
-            if isinstance(widget, QProgressDialog):
-                widget.close()
-
-        if is_valid:
-            QMessageBox.information(self, "Validation Successful", "Video file integrity check passed.")
-            self.continue_loading_video()
-        else:
-            QMessageBox.critical(self, "Validation Failed", f"{error_message}\nPlease choose a valid video file.")
-    
-    def continue_loading_video(self):
-        print("Validation successful. Loading video into the application...")
-        self.video_path = self.temp_path
-        self.video_path_label.setText(os.path.basename(self.video_path))
+        self.video_path = path
+        self.video_path_label.setText(os.path.basename(path))
 
         self.reset_all_caps()
         self.cleanup_temp_files()
