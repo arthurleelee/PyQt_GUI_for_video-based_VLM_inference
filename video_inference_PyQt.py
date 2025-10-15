@@ -1,37 +1,37 @@
-import sys
-import os
 import cv2
+import gc
+import imageio
+import math
+import multiprocessing as mp
+import numpy as np
+import os
+import shutil
+import signal
+import subprocess
+import supervision as sv
+import sys
 import time
 import torch
-import numpy as np
-import imageio
-import gc
-import subprocess
-import shutil
-import math
 import torchvision.transforms as T
-import supervision as sv
-import multiprocessing as mp
-import signal
 
+from PIL import ImageFont, Image, ImageDraw
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
+from PyQt6.QtGui import QImage, QPixmap, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QLabel, QFileDialog, QSlider, QSpinBox, QComboBox, QTextEdit, 
     QGroupBox, QFormLayout, QMessageBox, QProgressBar, QStyle, QSizePolicy, 
     QTabWidget, QColorDialog, QScrollArea, QLineEdit
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
-from PyQt6.QtGui import QImage, QPixmap, QColor
 from collections import deque
-from transformers import Qwen2_5_VLForConditionalGeneration, LlavaOnevisionForConditionalGeneration, AutoModelForImageTextToText, AutoTokenizer, AutoProcessor, AutoModel, AutoModelForZeroShotObjectDetection
-from qwen_vl_utils import process_vision_info
-from PIL import ImageFont, Image, ImageDraw
-from torchvision.transforms.functional import InterpolationMode
-from scipy.spatial import cKDTree
 from ffmpeg_progress_yield import FfmpegProgress
+from pynvml import *
+from qwen_vl_utils import process_vision_info
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
-from pynvml import *
+from scipy.spatial import cKDTree
+from transformers import Qwen2_5_VLForConditionalGeneration, LlavaOnevisionForConditionalGeneration, AutoModelForImageTextToText, AutoTokenizer, AutoProcessor, AutoModel, AutoModelForZeroShotObjectDetection
+from torchvision.transforms.functional import InterpolationMode
 
 
 STYLE_SHEET = """
@@ -191,6 +191,7 @@ class VLM_Inference():
         self.processor = None
         self.tokenizer = None
         self.conversation = None
+        self.texts = None
 
         print("--- Loading Conversation Template. ---")
         if "InternVL3_5" in self.params["model_name"]:
@@ -458,13 +459,25 @@ class VLM_Inference():
             inference_text = answer
             # print(f"The Results of Frame {curr_frame_number-1} and Frame {curr_frame_number}: {answer}")
         else:
-            inputs = self.processor(
-                text=[self.conversation], 
-                images=None, 
-                videos=[list(queue)], 
-                padding=True, 
-                return_tensors="pt", 
-            ).to(self.model.device, self.model.dtype)
+            if "Qwen2.5-VL" in self.params["model_name"]:
+                image_inputs, video_inputs, video_kwargs = process_vision_info(self.conversation, return_video_kwargs=True)
+                inputs = self.processor(
+                    text=self.texts, 
+                    images=image_inputs, 
+                    videos=video_inputs, 
+                    padding=True, 
+                    return_tensors="pt", 
+                    do_resize=False, 
+                    **video_kwargs
+                ).to(self.model.device, self.model.dtype)
+            else:
+                inputs = self.processor(
+                    text=[self.conversation], 
+                    images=None, 
+                    videos=[list(queue)], 
+                    padding=True, 
+                    return_tensors="pt", 
+                ).to(self.model.device, self.model.dtype)
 
             with torch.no_grad():
                 output_ids = self.model.generate(**inputs, max_new_tokens=256, eos_token_id=self.processor.tokenizer.eos_token_id, pad_token_id=self.processor.tokenizer.eos_token_id, do_sample=False)
@@ -487,27 +500,18 @@ class VLM_Inference():
             system_prompt = self.params["system_prompt"]
             user_prompt = self.params["user_prompt"]
             model_name = self.params["model_name"]
+            min_pixels = self.params["min_pixels"]
+            max_pixels = self.params["max_pixels"]
+            temp_dir = self.params["temp_dir"]
 
             try:
                 print(f"Loading Processor...")
                 if "Qwen2.5-VL" in model_name:
-                    # Temporarily fix this setting
-                    MIN_PIXELS = None # 224 * 28 * 28
-                    MAX_PIXELS = None # 840 * 28 * 28
-                    if MIN_PIXELS is not None and MAX_PIXELS is not None:
-                        self.processor = AutoProcessor.from_pretrained(
-                            model_name, 
-                            torch_dtype=torch.bfloat16,
-                            trust_remote_code=True, 
-                            min_pixels=MIN_PIXELS, 
-                            max_pixels=MAX_PIXELS, 
-                        )
-                    else:
-                        self.processor = AutoProcessor.from_pretrained(
-                            model_name, 
-                            torch_dtype=torch.bfloat16,
-                            trust_remote_code=True, 
-                        )
+                    self.processor = AutoProcessor.from_pretrained(
+                        model_name, 
+                        torch_dtype=torch.bfloat16,
+                        trust_remote_code=True, 
+                    )
                 elif "InternVL3_5" in model_name or "MiniCPM-V-4_5" in model_name:
                     pass
                 else:
@@ -548,12 +552,12 @@ class VLM_Inference():
                 gc.collect()
                 return
             
-            if "InternVL3_5" not in model_name and "MiniCPM-V-4_5" not in model_name:
+            if "Qwen2.5-VL" not in model_name and "InternVL3_5" not in model_name and "MiniCPM-V-4_5" not in model_name:
                 self.conversation = self.processor.apply_chat_template(
                     self.conversation, tokenize=False, add_generation_prompt=True
                 )
             if "InternVL3_5" in model_name:
-                self.model.system_message = self.params["system_prompt"]
+                self.model.system_message = system_prompt
 
             self.cap = cv2.VideoCapture(video_path)
             if not self.cap.isOpened():
@@ -592,6 +596,27 @@ class VLM_Inference():
                     queue.append(frame)
 
                     if len(queue) >= frame_accumulation:
+                        if "Qwen2.5-VL" in model_name:
+                            temp_video_path = os.path.abspath(os.path.join(temp_dir, "temp_video.mp4"))
+                            with imageio.get_writer(temp_video_path, fps=output_fps) as temp_video:
+                                for f in queue:
+                                    temp_video.append_data(np.asarray(f))
+                            
+                            for con in self.conversation:
+                                if con["role"] == "user":
+                                    for c in con["content"]:
+                                        if c["type"] == "video":
+                                            c["video"] = temp_video_path
+                                            c["fps"] = 1
+                                            if min_pixels is not None and max_pixels is not None:
+                                                c["min_pixels"] = min_pixels
+                                                c["max_pixels"] = max_pixels
+                            print(self.conversation)
+
+                            self.texts = [
+                                self.processor.apply_chat_template(self.conversation, tokenize=False, add_generation_prompt=True)
+                            ]
+
                         inference_text = self.run_inference_on_frames(queue, input_fps, current_frame_index)
 
                         for index in range(-stride_size, 0):
@@ -1155,7 +1180,7 @@ class MainWindow(QMainWindow):
 
         self.edited_video_path = None
         self.edited_cap = None
-        self.temp_dir = os.path.join(os.getcwd(), "video_modification_temp")
+        self.temp_dir = os.path.join(os.getcwd(), f"video_modification_temp_{time.strftime('%Y%m%d-%H%M%S')}")
         os.makedirs(self.temp_dir, exist_ok=True)
         self.undo_stack = []
         self.redo_stack = []
@@ -2033,6 +2058,10 @@ class MainWindow(QMainWindow):
             "system_prompt": self.system_prompt_edit.toPlainText(),
             "user_prompt": self.user_prompt_edit.toPlainText(),
             "model_name": self.model_combo.currentText(),
+            # Temporarily fix this setting for Qwen2.5-VL
+            "min_pixels": None, # 224 * 28 * 28
+            "max_pixels": None, # 840 * 28 * 28
+            "temp_dir": self.temp_dir,
         }
 
         self.set_ui_enabled(False, "Inference in progress...")
