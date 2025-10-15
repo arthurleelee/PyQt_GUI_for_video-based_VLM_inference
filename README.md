@@ -80,7 +80,7 @@ pip install ./Grounded-SAM-2
 # Create the virtual environment
 uv venv --python 3.10
 
-# Activate the virtual environment
+# Activate the virtual environment (Optional) 
 source .venv/bin/activate
 
 # Synchronize the virtual environment with pyproject.toml
