@@ -36,7 +36,7 @@ dependencies = [
     "pyqt6==6.9.1",
     "pyqt6-qt6==6.9.1",
     "qwen-omni-utils==0.0.8",
-    "qwen-vl-utils==0.0.11",
+    "qwen-vl-utils==0.0.14",
     "scikit-image==0.25.2",
     "setuptools>=80.9.0",
     "spacy==3.8.7",

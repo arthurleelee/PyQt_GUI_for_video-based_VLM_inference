@@ -114,7 +114,7 @@ python-dateutil==2.9.0.post0
 pytz==2025.2
 pyyaml==6.0.2
 qwen-omni-utils==0.0.8
-qwen-vl-utils==0.0.11
+qwen-vl-utils==0.0.14
 regex==2025.9.1
 requests==2.32.5
 rich==14.1.0
